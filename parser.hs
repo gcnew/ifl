@@ -48,18 +48,31 @@ isAtomicExpr _        = False
 
 preludeDefs :: CoreProgram
 preludeDefs = [
+    -- I x = x
     ("I", ["x"], EVar "x"),
+
+    -- K x y = x
     ("K", ["x","y"], EVar "x"),
+
+    -- K1 x y = y
     ("K1",["x","y"], EVar "y"),
+
+    -- S f g x = f x (g x)
     ("S", ["f","g","x"],
         EAp (EAp (EVar "f") (EVar "x")) (EAp (EVar "g") (EVar "x"))),
+
+    -- compose f g x = f (g x)
     ("compose", ["f","g","x"],
         EAp (EVar "f") (EAp (EVar "g") (EVar "x"))),
+
+    -- twice f = compose f f
     ("twice", ["f"], EAp (EAp (EVar "compose") (EVar "f")) (EVar "f")) ]
 
 data Iseq = INil
     | IStr String
     | IAppend Iseq Iseq
+    | IIndent Iseq
+    | INewline
 
 iNil :: Iseq                     -- The empty iseq
 iNil = INil
@@ -74,29 +87,34 @@ iNewline :: Iseq                 -- New line with indentation
 iNewline = IStr "\n"
 
 iIndent :: Iseq -> Iseq          -- Indent an iseq
-iIndent s = s
+iIndent s = IIndent s
 
 iDisplay :: Iseq -> String       -- Turn an iseq into a string
-iDisplay s = flatten [s]
+iDisplay s = flatten 0 [(0, s)]
 
 iConcat :: [Iseq] -> Iseq
-iConcat xs = foldl iAppend iNil xs
+iConcat xs = foldr iAppend iNil xs
 
 iInterleave :: Iseq -> [Iseq] -> Iseq
-iInterleave sep seqs = iConcat list
-    where list :: [Iseq]
-          list = join sep seqs
+iInterleave _ []       = iNil
+iInterleave _ [x]      = x
+iInterleave sep (x:xs) = x `iAppend` sep `iAppend` iInterleave sep xs 
 
-          join :: Iseq -> [Iseq] -> [Iseq]
-          join _ []     = []
-          join _ (x:[]) = [x]
-          join s (x:xs) = (x : s : (join s xs))
+flatten :: Int -> [(Int, Iseq)] -> String
+flatten _ []                                 = ""
+flatten col ((indent, INil) : seqs)          = flatten col seqs
+flatten col ((indent, IStr s) : seqs)        = (space indent) ++ s ++ flatten indent seqs
+flatten col ((indent, IAppend s1 s2) : seqs)
+    = flatten col ((indent, s1) : (indent, s2) : seqs)
 
-flatten :: [Iseq] -> String
-flatten []                     = ""
-flatten (INil : seqs)          = flatten seqs
-flatten (IStr s : seqs)        = s ++ flatten seqs
-flatten (IAppend s1 s2 : seqs) = flatten (s1 : s2 : seqs)
+flatten col ((indent, INewline) : ss)
+    = '\n' : (space indent) ++ (flatten indent ss)
+
+flatten col ((indent, IIndent s) : ss)
+    = flatten col ((col, s) : ss)
+
+space :: Int -> String
+space n = replicate n ' '
 
 pprExpr :: CoreExpr -> Iseq
 pprExpr (EVar v)    = iStr v
@@ -118,7 +136,16 @@ pprExpr (ELet isrec defns expr)
 pprExpr (ELam vars expr) = iConcat [ iStr "\\ ", (pprVarNames vars), iStr ". ", pprExpr expr ]
 
 pprExpr (ECase expr alts)
-    = iConcat [ iStr "case ", pprExpr expr ]
+    = iConcat [ iStr "case ", pprExpr expr, iStr " of", iNewline,
+                iIndent (pprAlts alts) ]
+
+pprAlts :: [CoreAlt] -> Iseq
+pprAlts alts = iInterleave iNewline (map pprAlt alts)
+
+pprAlt :: CoreAlt -> Iseq
+pprAlt (tag, vars, expr)
+    = iConcat [ iStr "<", iStr (show tag), iStr "> ",
+                pprVarNames vars, iStr " -> ", pprExpr expr ]
 
 pprAExpr :: CoreExpr -> Iseq
 pprAExpr e
