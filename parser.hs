@@ -84,13 +84,13 @@ iAppend :: Iseq -> Iseq -> Iseq  -- Append two iseqs
 iAppend s1 s2 = IAppend s1 s2
 
 iNewline :: Iseq                 -- New line with indentation
-iNewline = IStr "\n"
+iNewline = INewline
 
 iIndent :: Iseq -> Iseq          -- Indent an iseq
 iIndent s = IIndent s
 
 iDisplay :: Iseq -> String       -- Turn an iseq into a string
-iDisplay s = flatten 0 [(0, s)]
+iDisplay s = flatten 0 [(s, 0)]
 
 iConcat :: [Iseq] -> Iseq
 iConcat xs = foldr iAppend iNil xs
@@ -100,18 +100,19 @@ iInterleave _ []       = iNil
 iInterleave _ [x]      = x
 iInterleave sep (x:xs) = x `iAppend` sep `iAppend` iInterleave sep xs 
 
-flatten :: Int -> [(Int, Iseq)] -> String
-flatten _ []                                 = ""
-flatten col ((indent, INil) : seqs)          = flatten col seqs
-flatten col ((indent, IStr s) : seqs)        = (space indent) ++ s ++ flatten indent seqs
-flatten col ((indent, IAppend s1 s2) : seqs)
-    = flatten col ((indent, s1) : (indent, s2) : seqs)
+flatten :: Int -> [(Iseq, Int)] -> String
+flatten _ []                    = ""
+flatten col ((INil, _): seqs)   = flatten col seqs
+flatten col ((IStr s, _): seqs) = s ++ flatten (col + length s) seqs
 
-flatten col ((indent, INewline) : ss)
-    = '\n' : (space indent) ++ (flatten indent ss)
+flatten col (((IAppend s1 s2), indent): seqs)
+    = flatten col ((s1, indent) : (s2, indent) : seqs)
 
-flatten col ((indent, IIndent s) : ss)
-    = flatten col ((col, s) : ss)
+flatten col ((IIndent s, _) : seqs)
+    = flatten col ((s, col) : seqs)
+
+flatten _ ((INewline, indent) : seqs)
+    = '\n' : (space indent) ++ (flatten indent seqs)
 
 space :: Int -> String
 space n = replicate n ' '
@@ -127,8 +128,8 @@ pprExpr (EConstr tag arity)
                 iStr (show arity), iStr "}" ]
 
 pprExpr (ELet isrec defns expr)
-    = iConcat [ iStr keyword, iNewline,
-                iStr "  ", iIndent (pprDefns defns), iNewline,
+    = iConcat [ iStr keyword, 
+                iStr " ", iIndent (pprDefns defns), iNewline,
                 iStr "in ", pprExpr expr ]
     where keyword | isrec     = "letrec"
                   | otherwise = "let"
@@ -136,8 +137,8 @@ pprExpr (ELet isrec defns expr)
 pprExpr (ELam vars expr) = iConcat [ iStr "\\ ", (pprVarNames vars), iStr ". ", pprExpr expr ]
 
 pprExpr (ECase expr alts)
-    = iConcat [ iStr "case ", pprExpr expr, iStr " of", iNewline,
-                iIndent (pprAlts alts) ]
+    = iConcat [ iStr "case ", pprExpr expr, iStr " of ",
+                iIndent (iNewline `iAppend` pprAlts alts) ]
 
 pprAlts :: [CoreAlt] -> Iseq
 pprAlts alts = iInterleave iNewline (map pprAlt alts)
@@ -163,7 +164,8 @@ pprProgram :: CoreProgram -> Iseq
 pprProgram prog = iInterleave (iStr "\n\n") (map pprScDefn prog)
 
 pprScDefn :: CoreScDefn -> Iseq
-pprScDefn (name, vars, expr) = iConcat [ iStr name, iStr " ", pprVarNames vars, iStr " = ", pprExpr expr ]
+pprScDefn (name, vars, expr) = iConcat [ iStr name, iStr " ", pprVarNames vars,
+                                         iStr " = " , iIndent (pprExpr expr) ]
 
 pprVarNames :: [String] -> Iseq
 pprVarNames names = iInterleave (iStr " ") (map iStr names)
@@ -176,8 +178,27 @@ mkMultiAp :: Int -> CoreExpr -> CoreExpr -> CoreExpr
 mkMultiAp n e1 e2 = foldl EAp e1 (take n e2s)
     where e2s = e2 : e2s
 
+--main :: IO ()
+--main = putStrLn $ pprint preludeDefs
+
 main :: IO ()
-main = putStrLn $ pprint preludeDefs
+main = putStrLn $ pprint [ ("letSample", [], testLet), ("caseSample", [], testCase) ]
 
+testCase :: CoreExpr
+testCase = ECase (EVar "x") [
+    -- <0> v -> iStr v
+    (0, [ "v" ], (EAp (EVar "iStr") (EVar "v"))),
 
+    -- <1> num -> iStr (show num)
+    (1, [ "num" ], (EAp (EVar "iStr") (EAp (EVar "show") (EVar "num")))),
 
+    -- <2> x y z -> x + y * z
+    (2, [ "x", "y", "z" ], (EAp (EAp (EVar "+") (EVar "x")) (EAp (EAp (EVar "*") (EVar "y")) (EVar "z"))))
+    ]
+
+testLet :: CoreExpr
+testLet = (ELet False [
+    ("a", (ENum 3)),
+    ("b", (ENum 4))
+    ]
+    (EAp (EAp (EVar "+") (EVar "a")) (EVar "b")))
