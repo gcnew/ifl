@@ -98,6 +98,17 @@ iDisplay s = flatten 0 [(s, 0)]
 iConcat :: [Iseq] -> Iseq
 iConcat xs = foldr iAppend iNil xs
 
+iNum :: Int -> Iseq
+iNum n = iStr (show n)
+
+iFWNum :: Int -> Int -> Iseq
+iFWNum width n = iStr (space (width - length digits) ++ digits)
+    where digits = (show n)
+
+iLayn :: [Iseq] -> Iseq
+iLayn xs = iConcat (map layItem (zip [1..] xs))
+    where layItem (n, s) = iConcat [ iFWNum 4 n, iStr ") ", iIndent s, iNewline ]
+
 iInterleave :: Iseq -> [Iseq] -> Iseq
 iInterleave _ []       = iNil
 iInterleave _ [x]      = x
@@ -129,9 +140,10 @@ split sep arr = foldr splitter [[]] arr
 operators :: [String]
 operators = map (:[]) "+-*/"
 
+-- TODO: operator precedence / parens
 pprExpr :: CoreExpr -> Iseq
 pprExpr (EVar v)    = iStr v
-pprExpr (ENum num)  = iStr (show num)
+pprExpr (ENum num)  = iNum num
 
 pprExpr (EAp (EAp (EVar op) e1) e2)
     | op `elem` operators = iConcat [ pprAExpr e1, iStr " ", iStr op, iStr " ", pprAExpr e2 ]
@@ -139,8 +151,8 @@ pprExpr (EAp e1 e2) = (pprExpr e1) `iAppend` (iStr " ") `iAppend` (pprAExpr e2)
 
 pprExpr (EConstr tag arity)
     = iConcat [ iStr "Pack{",
-                iStr (show tag), iStr ", ",
-                iStr (show arity), iStr "}" ]
+                iNum tag, iStr ", ",
+                iNum arity, iStr "}" ]
 
 pprExpr (ELet isrec defns expr)
     = iConcat [ iStr keyword,
@@ -160,7 +172,7 @@ pprAlts alts = iInterleave iNewline (map pprAlt alts)
 
 pprAlt :: CoreAlt -> Iseq
 pprAlt (tag, vars, expr)
-    = iConcat [ iStr "<", iStr (show tag), iStr "> ",
+    = iConcat [ iStr "<", iNum tag, iStr "> ",
                 pprVarNames vars, iStr " -> ", pprExpr expr ]
 
 pprAExpr :: CoreExpr -> Iseq
