@@ -73,15 +73,18 @@ data Iseq = INil
     | IAppend Iseq Iseq
     | IIndent Iseq
     | INewline
+    deriving (Show)
 
 iNil :: Iseq                     -- The empty iseq
 iNil = INil
 
 iStr :: String -> Iseq           -- Turn a string into an iseq
-iStr str = IStr str
+iStr = (iInterleave iNewline) . (map IStr) . (split '\n')
 
 iAppend :: Iseq -> Iseq -> Iseq  -- Append two iseqs
-iAppend s1 s2 = IAppend s1 s2
+iAppend INil s2   = s2
+iAppend s1   INil = s1
+iAppend s1   s2   = IAppend s1 s2
 
 iNewline :: Iseq                 -- New line with indentation
 iNewline = INewline
@@ -117,6 +120,10 @@ flatten _ ((INewline, indent) : seqs)
 space :: Int -> String
 space n = replicate n ' '
 
+split :: Eq a => a -> [a] -> [[a]]
+split sep arr = foldr splitter [[]] arr
+    where splitter c acc@(x:xs) | c /= sep  = ((c:x):xs)
+                                | otherwise = [] : acc
 pprExpr :: CoreExpr -> Iseq
 pprExpr (EVar v)    = iStr v
 pprExpr (ENum num)  = iStr (show num)
