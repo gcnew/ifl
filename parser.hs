@@ -122,7 +122,8 @@ space n = replicate n ' '
 
 split :: Eq a => a -> [a] -> [[a]]
 split sep arr = foldr splitter [[]] arr
-    where splitter c acc@(x:xs) | c /= sep  = ((c:x):xs)
+    where splitter _ [] = undefined -- should never happen, silence warnings
+          splitter c acc@(x:xs) | c /= sep  = ((c:x):xs)
                                 | otherwise = [] : acc
 
 operators :: [String]
