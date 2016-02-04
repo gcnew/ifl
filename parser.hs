@@ -101,7 +101,7 @@ iConcat xs = foldr iAppend iNil xs
 iInterleave :: Iseq -> [Iseq] -> Iseq
 iInterleave _ []       = iNil
 iInterleave _ [x]      = x
-iInterleave sep (x:xs) = x `iAppend` sep `iAppend` iInterleave sep xs 
+iInterleave sep (x:xs) = x `iAppend` sep `iAppend` iInterleave sep xs
 
 flatten :: Int -> [(Iseq, Int)] -> String
 flatten _ []                    = ""
@@ -124,9 +124,16 @@ split :: Eq a => a -> [a] -> [[a]]
 split sep arr = foldr splitter [[]] arr
     where splitter c acc@(x:xs) | c /= sep  = ((c:x):xs)
                                 | otherwise = [] : acc
+
+operators :: [String]
+operators = map (:[]) "+-*/"
+
 pprExpr :: CoreExpr -> Iseq
 pprExpr (EVar v)    = iStr v
 pprExpr (ENum num)  = iStr (show num)
+
+pprExpr (EAp (EAp (EVar op) e1) e2)
+    | op `elem` operators = iConcat [ pprAExpr e1, iStr " ", iStr op, iStr " ", pprAExpr e2 ]
 pprExpr (EAp e1 e2) = (pprExpr e1) `iAppend` (iStr " ") `iAppend` (pprAExpr e2)
 
 pprExpr (EConstr tag arity)
@@ -135,7 +142,7 @@ pprExpr (EConstr tag arity)
                 iStr (show arity), iStr "}" ]
 
 pprExpr (ELet isrec defns expr)
-    = iConcat [ iStr keyword, 
+    = iConcat [ iStr keyword,
                 iStr " ", iIndent (pprDefns defns), iNewline,
                 iStr "in ", pprExpr expr ]
     where keyword | isrec     = "letrec"
