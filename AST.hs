@@ -34,6 +34,8 @@ type CoreScDefn = ScDefn Name
 type Program a = [ScDefn a]
 type CoreProgram = Program Name
 
+type LetDefn a = (a, Expr a)
+type CoreLetDefn = LetDefn Name
 
 bindersOf :: [(a,b)] -> [a]
 bindersOf defns = [name | (name, _) <- defns]
