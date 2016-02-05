@@ -1,3 +1,5 @@
+{-# OPTIONS_GHC -Wall #-}
+
 module Iseq where
 
 import Utils

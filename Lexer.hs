@@ -1,3 +1,5 @@
+{-# OPTIONS_GHC -Wall #-}
+
 module Lexer where
 
 import Data.Char (isDigit, isAlpha)

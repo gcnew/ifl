@@ -1,3 +1,5 @@
+{-# OPTIONS_GHC -Wall #-}
+
 module AST where
 
 type Name = String
