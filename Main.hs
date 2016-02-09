@@ -1,6 +1,6 @@
 {-# OPTIONS_GHC -Wall #-}
 
-module Language where
+module Main where
 
 import Iseq ()
 import AST
