@@ -1,4 +1,3 @@
-{-# OPTIONS_GHC -Wall #-}
 
 module TeamplateInst where
 
@@ -38,12 +37,20 @@ applyToStats :: (TiStats -> TiStats) -> TiState -> TiState
 applyToStats statsFun (stack, dump, heap, scDefs, stats)
     = (stack, dump, heap, scDefs, statsFun stats)
 
-showResults :: [TiState] -> [Char]
-showResults states = iDisplay $ iConcat [ iLayn (map showState states),
-                                          showStats (last states) ]
+showResults :: Bool -> [TiState] -> String
+showResults withHeap states = iDisplay $ iConcat [ iLayn (map (showState withHeap) states),
+                                                   showStats (last states) ]
 
-showState :: TiState -> Iseq
-showState (stack, _, heap, _, _) = iConcat [ showStack heap stack, iNewline ]
+showState :: Bool -> TiState -> Iseq
+showState withHeap (stack, _, heap, _, _)
+    = iConcat [ showStack heap stack, iNewline, heapSeq ]
+    where heapSeq | withHeap  = showHeap heap `iAppend` iNewline
+                  | otherwise = iNil
+
+showHeap :: TiHeap -> Iseq
+showHeap heap = iInterleave iNewline $ map formatter tuples
+    where formatter (addr, node) = iConcat [ showFWAddr addr, iStr " -> ", showNode node ]
+          tuples =  [ (addr, hLookup heap addr) | addr <- hAddresses heap ]
 
 showStack :: TiHeap -> TiStack -> Iseq
 showStack heap stack
@@ -54,10 +61,10 @@ showStack heap stack
                 showStkNode heap (hLookup heap addr) ]
 
 showStkNode :: TiHeap -> Node -> Iseq
-showStkNode heap (NAp fun_addr arg_addr)
-    = iConcat [ iStr "NAp ", showFWAddr fun_addr,
-                iStr " ", showFWAddr arg_addr, iStr " (",
-                showNode (hLookup heap arg_addr), iStr ")" ]
+showStkNode heap (NAp funAddr argAddr)
+    = iConcat [ iStr "NAp ", showFWAddr funAddr,
+                iStr " ", showFWAddr argAddr, iStr " (",
+                showNode (hLookup heap argAddr), iStr ")" ]
 showStkNode _ node = showNode node
 
 showNode :: Node -> Iseq
@@ -80,9 +87,16 @@ showStats (_, _, _, _, stats)
                 iNum (tiStatGetSteps stats) ]
 
 eval :: TiState -> [TiState]
+eval state = state : restStates
+    where restStates | tiFinal state = []
+                     | otherwise     = eval nextState
+          nextState = doAdmin (step state)
 
-runProg :: [Char] -> [Char]
-runProg = showResults . eval . compile . parse -- "run": name conflict
+runProg :: String -> String
+runProg = showResults False . eval . compile . parse
+
+runDebugProg :: String -> String
+runDebugProg = showResults True . eval . compile . parse
 
 extraPreludeDefs :: CoreProgram
 extraPreludeDefs = []
@@ -102,11 +116,6 @@ buildInitialHeap scDefs = mapAccuml allocateSc hInitial scDefs
 allocateSc :: TiHeap -> CoreScDefn -> (TiHeap, (Name, Addr))
 allocateSc heap (name, args, body) = (heap', (name, addr))
     where (heap', addr) = hAlloc heap (NSupercomb name args body)
-
-eval state = state : restStates
-    where restStates | tiFinal state = []
-                     | otherwise     = eval nextState
-          nextState = doAdmin (step state)
 
 doAdmin :: TiState -> TiState
 doAdmin state = applyToStats tiStatIncSteps state
@@ -137,7 +146,10 @@ apStep :: TiState -> Addr -> Addr -> TiState
 apStep (stack, dump, heap, globals, stats) a1 _a2 = (a1 : stack, dump, heap, globals, stats)
 
 scStep :: TiState -> Name -> [Name] -> CoreExpr -> TiState
-scStep (stack, dump, heap, globals, stats) _ argNames body = (newStack, dump, newHeap, globals, stats)
+scStep (stack, dump, heap, globals, stats) _ argNames body
+    | length stack < length argNames + 1 = error $ "Insufficient number of arguments"
+    | otherwise                          = (newStack, dump, newHeap, globals, stats)
+
     where newStack = resultAddr : (drop (length argNames + 1) stack)
           (newHeap, resultAddr) = instantiate body heap env
           env = argBindings ++ globals
