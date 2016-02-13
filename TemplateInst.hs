@@ -1,3 +1,4 @@
+{-# OPTIONS_GHC -Wall #-}
 
 module TeamplateInst where
 
@@ -156,7 +157,7 @@ scStep (stack, dump, heap, globals, stats) _ argNames body
           argBindings = zip argNames (getargs heap stack)
 
 getargs :: TiHeap -> TiStack -> [Addr]
-getargs heap (_:stack) = map getarg stack
+getargs heap stack = map getarg (tail stack) -- skip the supercombinator
     where getarg addr = let (NAp _ arg) = hLookup heap addr
                          in arg
 
@@ -175,9 +176,15 @@ instantiate (EAp e1 e2) heap env = hAlloc heap2 (NAp a1 a2)
 instantiate (EVar v) heap env = (heap, aLookup env v err)
     where err = error ("Undefined name " ++ show v)
 
-instantiate (EConstr tag arity) heap env = instantiateConstr tag arity heap env
-instantiate (ELet isrec defs body) heap env = instantiateLet isrec defs body heap env
-instantiate (ECase _ _) _ _ = error "Can’t instantiate case exprs"
+instantiate (ELet isRec defs body) heap env = instantiate body newHeap newEnv
+    where allocDef (curHeap, curEnv) (name, expr) = let env' | isRec     = newEnv -- bind to final env
+                                                             | otherwise = curEnv -- bind to current env
+                                                        (heap', addr) = instantiate expr curHeap env'
+                                                     in (heap', (name, addr) : curEnv)
+          (newHeap, newEnv) = foldl allocDef (heap, env) defs
 
-instantiateConstr _tag _arity _heap _env = error "Can’t instantiate constructors yet"
-instantiateLet _isrec _defs _body _heap _env = error "Can’t instantiate let(rec)s yet"
+instantiate (EConstr _tag _arity) _heap _env = error "Can't instantiate constructors yet"
+
+instantiate (ECase _ _) _ _ = error "Can't instantiate case exprs"
+instantiate (ELam _args _body) _heap _env
+    = error "Can't instantiate lambda (should be converted to supercombinator)"
