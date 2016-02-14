@@ -17,6 +17,7 @@ type TiState = (TiStack, TiDump, TiHeap, TiGlobals, TiStats)
 data Node = NAp Addr Addr                    -- Application
           | NSupercomb Name [Name] CoreExpr  -- Supercombinator
           | NNum Int                         -- A number
+          | NInd Addr                        -- Indirection
 
 data TiDump = DummyTiDump
 
@@ -74,6 +75,7 @@ showNode (NAp a1 a2) = iConcat [ iStr "NAp ", showAddr a1,
 
 showNode (NSupercomb name _ _) = iStr ("NSupercomb " ++ name)
 showNode (NNum n) = (iStr "NNum ") `iAppend` (iNum n)
+showNode (NInd a) = iStr "NInd " `iAppend` showAddr a
 
 showAddr :: Addr -> Iseq
 showAddr addr = iStr (showaddr addr)
@@ -137,11 +139,16 @@ step state = dispatch (hLookup heap (head stack))
     where (stack, _, heap, _, _) = state
 
           dispatch (NNum n)    = numStep state n
+          dispatch (NInd addr) = indStep state addr
           dispatch (NAp a1 a2) = apStep state a1 a2
           dispatch (NSupercomb sc args body) = scStep state sc args body
 
 numStep :: TiState -> Int -> TiState
 numStep _ _ = error "Number applied as a function!"
+
+indStep :: TiState -> Addr -> TiState
+indStep (_:stack, dump, heap, globals, stats) addr = (addr:stack, dump, heap, globals, stats)
+indStep _ _ = error "Spine stack should have indirection address on top."
 
 apStep :: TiState -> Addr -> Addr -> TiState
 apStep (stack, dump, heap, globals, stats) a1 _a2 = (a1 : stack, dump, heap, globals, stats)
@@ -151,8 +158,10 @@ scStep (stack, dump, heap, globals, stats) _ argNames body
     | length stack < length argNames + 1 = error $ "Insufficient number of arguments"
     | otherwise                          = (newStack, dump, newHeap, globals, stats)
 
-    where newStack = resultAddr : (drop (length argNames + 1) stack)
-          (newHeap, resultAddr) = instantiate body heap env
+    where (rdxRoot:stack') = drop (length argNames) stack
+          newStack = resultAddr : stack'
+          newHeap = hUpdate resultHeap rdxRoot (NInd resultAddr)
+          (resultHeap, resultAddr) = instantiate body heap env
           env = argBindings ++ globals
           argBindings = zip argNames (getargs heap stack)
 
