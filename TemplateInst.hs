@@ -158,10 +158,8 @@ scStep (stack, dump, heap, globals, stats) _ argNames body
     | length stack < length argNames + 1 = error $ "Insufficient number of arguments"
     | otherwise                          = (newStack, dump, newHeap, globals, stats)
 
-    where (rdxRoot:stack') = drop (length argNames) stack
-          newStack = resultAddr : stack'
-          newHeap = hUpdate resultHeap rdxRoot (NInd resultAddr)
-          (resultHeap, resultAddr) = instantiate body heap env
+    where newStack@(rdxRoot:_) = drop (length argNames) stack
+          newHeap = instantiateAndUpdate body rdxRoot heap env
           env = argBindings ++ globals
           argBindings = zip argNames (getargs heap stack)
 
@@ -196,4 +194,32 @@ instantiate (EConstr _tag _arity) _heap _env = error "Can't instantiate construc
 
 instantiate (ECase _ _) _ _ = error "Can't instantiate case exprs"
 instantiate (ELam _args _body) _heap _env
+    = error "Can't instantiate lambda (should be converted to supercombinator)"
+
+instantiateAndUpdate :: CoreExpr            -- Body of supercombinator
+                        -> Addr
+                        -> TiHeap           -- Heap before instantiation
+                        -> ASSOC Name Addr  -- Association of names to addresses
+                        -> TiHeap           -- Heap after instantiation
+
+instantiateAndUpdate (ENum n) updAddr heap _ = hUpdate heap updAddr (NNum n)
+
+instantiateAndUpdate (EAp e1 e2) updAddr heap env = hUpdate heap2 updAddr (NAp a1 a2)
+    where (heap1, a1) = instantiate e1 heap env
+          (heap2, a2) = instantiate e2 heap1 env
+
+instantiateAndUpdate (EVar v) updAddr heap env = hUpdate heap updAddr (NInd $ aLookup env v err)
+    where err = error ("Undefined name " ++ show v)
+
+instantiateAndUpdate (ELet isRec defs body) updAddr heap env = instantiateAndUpdate body updAddr newHeap newEnv
+    where allocDef (curHeap, curEnv) (name, expr) = let env' | isRec     = newEnv -- bind to final env
+                                                             | otherwise = curEnv -- bind to current env
+                                                        (heap', addr) = instantiate expr curHeap env'
+                                                     in (heap', (name, addr) : curEnv)
+          (newHeap, newEnv) = foldl allocDef (heap, env) defs
+
+instantiateAndUpdate (EConstr _tag _arity) _updAddr _heap _env = error "Can't instantiate constructors yet"
+
+instantiateAndUpdate (ECase _ _) _ _ _ = error "Can't instantiate case exprs"
+instantiateAndUpdate (ELam _ _) _ _ _
     = error "Can't instantiate lambda (should be converted to supercombinator)"
