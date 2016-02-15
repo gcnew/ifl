@@ -3,6 +3,7 @@
 module TeamplateInst where
 
 import AST
+import Heap
 import Iseq
 import Utils
 import Parser (parse)
