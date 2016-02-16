@@ -11,6 +11,10 @@ split sep arr = foldr splitter [[]] arr
           splitter c acc@(x:xs) | c /= sep  = ((c:x):xs)
                                 | otherwise = [] : acc
 
+zipNWith :: ([a] -> b) -> [[a]] -> [b]
+zipNWith f xss | any null xss = []
+               | otherwise    = f (map head xss) : zipNWith f (map tail xss)
+
 type ASSOC a b = [(a,b)]
 
 aLookup :: (Eq a) => ASSOC a b -> a -> b -> b

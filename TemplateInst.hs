@@ -20,6 +20,10 @@ data Node = NAp Addr Addr                    -- Application
           | NNum Int                         -- A number
           | NInd Addr                        -- Indirection
 
+data ShowStateOptions = ShowStateOptions { ssHeap :: Bool
+                                         , ssEnv  :: Bool
+                                         }
+
 data TiDump = DummyTiDump
 
 initialTiDump :: TiDump
@@ -40,20 +44,31 @@ applyToStats :: (TiStats -> TiStats) -> TiState -> TiState
 applyToStats statsFun (stack, dump, heap, scDefs, stats)
     = (stack, dump, heap, scDefs, statsFun stats)
 
-showResults :: Bool -> [TiState] -> String
-showResults withHeap states = iDisplay $ iConcat [ iLayn (map (showState withHeap) states),
-                                                   showStats (last states) ]
+showResults :: ShowStateOptions -> [TiState] -> String
+showResults opts states = iDisplay $ iConcat [ iLayn (map (showState opts) states),
+                                               showStats (last states) ]
 
-showState :: Bool -> TiState -> Iseq
-showState withHeap (stack, _, heap, _, _)
-    = iConcat [ showStack heap stack, iNewline, heapSeq ]
-    where heapSeq | withHeap  = showHeap heap `iAppend` iNewline
-                  | otherwise = iNil
+showState :: ShowStateOptions -> TiState -> Iseq
+showState opts (stack, _, heap, env, _)
+    = iConcat [ showStack heap stack, iNewline, extra ]
+    where heapLines | ssHeap opts = showHeap heap
+                    | otherwise   = []
 
-showHeap :: TiHeap -> Iseq
-showHeap heap = iInterleave iNewline $ map formatter tuples
+          envLines  | ssEnv opts  = showEnv env
+                    | otherwise   = []
+
+          extra | null views = iNil
+                | otherwise  = iSplitView views `iAppend` iNewline
+                where views = filter (not . null) [ heapLines, envLines ]
+
+showHeap :: TiHeap -> [Iseq]
+showHeap heap = map formatter tuples
     where formatter (addr, node) = iConcat [ showFWAddr addr, iStr " -> ", showNode node ]
           tuples =  [ (addr, hLookup heap addr) | addr <- hAddresses heap ]
+
+showEnv :: TiGlobals -> [Iseq]
+showEnv env = map formatter env
+    where formatter (name, addr) = iConcat [ iStr name, iStr " -> ", showFWAddr addr ]
 
 showStack :: TiHeap -> TiStack -> Iseq
 showStack heap stack
@@ -97,10 +112,10 @@ eval state = state : restStates
           nextState = doAdmin (step state)
 
 runProg :: String -> String
-runProg = showResults False . eval . compile . parse
+runProg = showResults (ShowStateOptions False False) . eval . compile . parse
 
-runDebugProg :: String -> String
-runDebugProg = showResults True . eval . compile . parse
+runDebugProg :: ShowStateOptions -> String -> String
+runDebugProg opts = showResults opts . eval . compile . parse
 
 extraPreludeDefs :: CoreProgram
 extraPreludeDefs = []

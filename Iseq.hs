@@ -50,6 +50,19 @@ iInterleave _ []       = iNil
 iInterleave _ [x]      = x
 iInterleave sep (x:xs) = x `iAppend` sep `iAppend` iInterleave sep xs
 
+iSplitView :: [[Iseq]] -> Iseq
+iSplitView = iInterleave iNewline . map cf . eqlzLineSz . eqlzLineCount . stringify
+    where cf = iInterleave (iStr "  |  ") . map iStr  -- concat function
+
+          stringify      = map (map iDisplay)
+          padWith x n xs = xs ++ replicate (n - length xs) x
+
+          maxLines       = maximum . map length
+          maxLinesLength = map (maximum . map length)
+
+          eqlzLineCount views = map (padWith "" (maxLines views)) views
+          eqlzLineSz    views = zipNWith (zipWith (padWith ' ') (maxLinesLength views)) views
+
 flatten :: Int -> [(Iseq, Int)] -> String
 flatten _ []                    = ""
 flatten col ((INil, _): seqs)   = flatten col seqs
