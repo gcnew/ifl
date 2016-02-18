@@ -15,19 +15,26 @@ type TiGlobals = ASSOC Name Addr
 
 type TiState = (TiStack, TiDump, TiHeap, TiGlobals, TiStats)
 
+data Primitive = Neg | Add | Sub | Mul | Div
 data Node = NAp Addr Addr                    -- Application
           | NSupercomb Name [Name] CoreExpr  -- Supercombinator
           | NNum Int                         -- A number
           | NInd Addr                        -- Indirection
+          | NPrim Name Primitive             -- Primitive
 
 data ShowStateOptions = ShowStateOptions { ssHeap :: Bool
                                          , ssEnv  :: Bool
                                          }
 
-data TiDump = DummyTiDump
+type TiDump = [TiStack]
+
+primitives :: ASSOC Name Primitive
+primitives = [ ("negate", Neg),
+               ("+", Add), ("-", Sub),
+               ("*", Mul), ("/", Div) ]
 
 initialTiDump :: TiDump
-initialTiDump = DummyTiDump
+initialTiDump = []
 
 type TiStats = Int
 
@@ -89,9 +96,11 @@ showNode :: Node -> Iseq
 showNode (NAp a1 a2) = iConcat [ iStr "NAp ", showAddr a1,
                                  iStr " ", showAddr a2 ]
 
+showNode (NPrim name _)        = iStr ("NPrim " ++ name)
 showNode (NSupercomb name _ _) = iStr ("NSupercomb " ++ name)
-showNode (NNum n) = (iStr "NNum ") `iAppend` (iNum n)
-showNode (NInd a) = iStr "NInd " `iAppend` showAddr a
+
+showNode (NNum n)       = iStr "NNum "  `iAppend` iNum n
+showNode (NInd a)       = iStr "NInd "  `iAppend` showAddr a
 
 showAddr :: Addr -> Iseq
 showAddr addr = iStr (showaddr addr)
@@ -130,17 +139,23 @@ compile program = (initialStack, initialTiDump, initialHeap, globals, tiStatInit
           addressOfMain = aLookup globals "main" (error "main is not defined")
 
 buildInitialHeap :: [CoreScDefn] -> (TiHeap, TiGlobals)
-buildInitialHeap scDefs = mapAccuml allocateSc hInitial scDefs
+buildInitialHeap scDefs = (heap2, scAddrs ++ primAddrs)
+    where (heap1, scAddrs)   = mapAccuml allocateSc hInitial scDefs
+          (heap2, primAddrs) = mapAccuml allocatePrim heap1 primitives
 
 allocateSc :: TiHeap -> CoreScDefn -> (TiHeap, (Name, Addr))
 allocateSc heap (name, args, body) = (heap', (name, addr))
     where (heap', addr) = hAlloc heap (NSupercomb name args body)
 
+allocatePrim :: TiHeap -> (Name, Primitive) -> (TiHeap, (Name, Addr))
+allocatePrim heap (name, prim) = (heap', (name, addr))
+    where (heap', addr) = hAlloc heap (NPrim name prim)
+
 doAdmin :: TiState -> TiState
 doAdmin state = applyToStats tiStatIncSteps state
 
 tiFinal :: TiState -> Bool
-tiFinal ([soleAddr], _, heap, _, _)
+tiFinal ([soleAddr], [], heap, _, _)
     = isDataNode (hLookup heap soleAddr)
 
 tiFinal ([], _, _, _, _) = error "Empty stack!"
@@ -157,17 +172,65 @@ step state = dispatch (hLookup heap (head stack))
           dispatch (NNum n)    = numStep state n
           dispatch (NInd addr) = indStep state addr
           dispatch (NAp a1 a2) = apStep state a1 a2
+
+          dispatch (NPrim _ prim) = primStep state prim
           dispatch (NSupercomb sc args body) = scStep state sc args body
 
+-- Number:
+--    a:[]   s:d   h[ a: NNum n ]   f
+-- ->    s     d   h                f
+
 numStep :: TiState -> Int -> TiState
+numStep ([_], prevStack:dump', heap, globals, stats) _
+    = (prevStack, dump', heap, globals, stats)
+
 numStep _ _ = error "Number applied as a function!"
+
+-- Indirection:
+--     a:s   d   h[ a: NInd a1 ]   f
+-- -> a1:s   d   h                 f
 
 indStep :: TiState -> Addr -> TiState
 indStep (_:stack, dump, heap, globals, stats) addr = (addr:stack, dump, heap, globals, stats)
 indStep _ _ = error "Spine stack should have indirection address on top."
 
+-- Application:
+--    a:s   d   h┌ a:  NAp a1 a2 ┐   f
+--               └ a2: NInd a3   ┘
+-- -> a:s   d   h[ a:  NAp a1 a3 ]   f
+
+--       a:s   d   h[ a:  NAp a1 a2 ]   f
+-- -> a1:a:s   d   h                    f
+
 apStep :: TiState -> Addr -> Addr -> TiState
-apStep (stack, dump, heap, globals, stats) a1 _a2 = (a1 : stack, dump, heap, globals, stats)
+apStep (stack, dump, heap, globals, stats) a1 a2
+    | (NInd a3) <- hLookup heap a2 = let a = head stack;
+                                         heap' = hUpdate heap a (NAp a1 a3)
+                                      in (a1:stack, dump, heap', globals, stats)
+
+    | otherwise                    = (a1:stack, dump, heap, globals, stats)
+
+-- Primitive:
+--    a:a1:[]   d   h┌ a:  NPrim p ┐   f
+--                   │ a1: NAp a b │
+--                   └ b:  Num n   ┘
+-- ->   a1:[]   d   h[ a1: p n     ]   f
+
+--    a:a1:[]           d   h┌ a:  NPrim _  ┐   f
+--                           └ a1: NAp a b  ┘
+-- ->    b:[]   (a1:[]):d   h                   f
+
+primStep :: TiState -> Primitive -> TiState
+primStep (_ : stack'@[a1], dump, heap, globals, stats) Neg
+    | (NNum n) <- bNode = let heap' = hUpdate heap a1 (NNum (negate n))
+                           in (stack', dump, heap', globals, stats)
+
+    | otherwise         = ([b], stack':dump, heap, globals, stats)
+
+    where (NAp _ b) = hLookup heap a1
+          bNode     = hLookup heap b
+
+primStep _ _ = error "Not yet implemented or arguments error"
 
 scStep :: TiState -> Name -> [Name] -> CoreExpr -> TiState
 scStep (stack, dump, heap, globals, stats) _ argNames body
