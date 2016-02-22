@@ -12,6 +12,7 @@ split sep arr = foldr splitter [[]] arr
                                 | otherwise = [] : acc
 
 zipNWith :: ([a] -> b) -> [[a]] -> [b]
+zipNWith _ [] = []
 zipNWith f xss | any null xss = []
                | otherwise    = f (map head xss) : zipNWith f (map tail xss)
 
