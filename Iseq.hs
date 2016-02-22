@@ -15,7 +15,9 @@ iNil :: Iseq                     -- The empty iseq
 iNil = INil
 
 iStr :: String -> Iseq           -- Turn a string into an iseq
-iStr = (iInterleave iNewline) . (map IStr) . (split '\n')
+iStr = iInterleave iNewline . map mkIStr . split '\n'
+    where mkIStr ""  = iNil
+          mkIStr str = IStr str
 
 iAppend :: Iseq -> Iseq -> Iseq  -- Append two iseqs
 iAppend INil s2   = s2
@@ -50,11 +52,11 @@ iInterleave _ []       = iNil
 iInterleave _ [x]      = x
 iInterleave sep (x:xs) = x `iAppend` sep `iAppend` iInterleave sep xs
 
-iSplitView :: [[Iseq]] -> Iseq
-iSplitView = iInterleave iNewline . map cf . eqlzLineSz . eqlzLineCount . stringify
+iSplitView :: [Iseq] -> Iseq
+iSplitView = iInterleave iNewline . map cf . eqlzLineSz . eqlzLineCount . toStringLines
     where cf = iInterleave (iStr "  |  ") . map iStr  -- concat function
 
-          stringify      = map (map iDisplay)
+          toStringLines  = map (split '\n' . iDisplay)
           padWith x n xs = xs ++ replicate (n - length xs) x
 
           maxLines       = maximum . map length

@@ -24,6 +24,7 @@ data Node = NAp Addr Addr                    -- Application
 
 data ShowStateOptions = ShowStateOptions { ssHeap :: Bool
                                          , ssEnv  :: Bool
+                                         , ssDump :: Bool
                                          }
 
 type TiDump = [TiStack]
@@ -56,25 +57,34 @@ showResults opts states = iDisplay $ iConcat [ iLayn (map (showState opts) state
                                                showStats (last states) ]
 
 showState :: ShowStateOptions -> TiState -> Iseq
-showState opts (stack, _, heap, env, _)
+showState opts (stack, dump, heap, env, _)
     = iConcat [ showStack heap stack, iNewline, extra ]
     where heapLines | ssHeap opts = showHeap heap
-                    | otherwise   = []
+                    | otherwise   = iNil
 
           envLines  | ssEnv opts  = showEnv env
-                    | otherwise   = []
+                    | otherwise   = iNil
+
+          dumpLines | ssDump opts = showDump heap dump
+                    | otherwise   = iNil
 
           extra | null views = iNil
                 | otherwise  = iSplitView views `iAppend` iNewline
-                where views = filter (not . null) [ heapLines, envLines ]
+                where views = filter (not . isNil) [ heapLines, envLines, dumpLines ]
 
-showHeap :: TiHeap -> [Iseq]
-showHeap heap = map formatter tuples
+                      isNil INil = True
+                      isNil _    = False
+
+showHeap :: TiHeap -> Iseq
+showHeap heap = iInterleave iNewline (map formatter tuples)
     where formatter (addr, node) = iConcat [ showFWAddr addr, iStr " -> ", showNode node ]
           tuples =  [ (addr, hLookup heap addr) | addr <- hAddresses heap ]
 
-showEnv :: TiGlobals -> [Iseq]
-showEnv env = map formatter env
+showDump :: TiHeap -> TiDump -> Iseq
+showDump heap = iInterleave iNewline . map (showStack heap)
+
+showEnv :: TiGlobals -> Iseq
+showEnv = iInterleave iNewline . map formatter
     where formatter (name, addr) = iConcat [ iStr name, iStr " -> ", showFWAddr addr ]
 
 showStack :: TiHeap -> TiStack -> Iseq
@@ -121,10 +131,10 @@ eval state = state : restStates
           nextState = doAdmin (step state)
 
 runProg :: String -> String
-runProg = showResults (ShowStateOptions False False) . eval . compile . parse
+runProg = showResults (ShowStateOptions False False False) . eval . compile . parse
 
-runDebugProg :: ShowStateOptions -> String -> String
-runDebugProg opts = showResults opts . eval . compile . parse
+runDebugProg :: String -> String
+runDebugProg = showResults (ShowStateOptions True True True) . eval . compile . parse
 
 extraPreludeDefs :: CoreProgram
 extraPreludeDefs = []
