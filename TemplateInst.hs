@@ -220,7 +220,7 @@ apStep (stack, dump, heap, globals, stats) a1 a2
 
     | otherwise                    = (a1:stack, dump, heap, globals, stats)
 
--- Primitive:
+-- Primitive (single arg):
 --    a:a1:[]   d   h┌ a:  NPrim p ┐   f
 --                   │ a1: NAp a b │
 --                   └ b:  Num n   ┘
@@ -231,14 +231,40 @@ apStep (stack, dump, heap, globals, stats) a1 a2
 -- ->    b:[]   (a1:[]):d   h                   f
 
 primStep :: TiState -> Primitive -> TiState
-primStep (_ : stack'@[a1], dump, heap, globals, stats) Neg
-    | (NNum n) <- bNode = let heap' = hUpdate heap a1 (NNum (negate n))
-                           in (stack', dump, heap', globals, stats)
 
-    | otherwise         = ([b], stack':dump, heap, globals, stats)
+-- single argument
+primStep ([_, a1], dump, heap, globals, stats) Neg
+    | (NNum n) <- bNode = let heap' = hUpdate heap a1 (NNum (negate n))
+                           in ([a1], dump, heap', globals, stats)
+
+    | not (isDataNode bNode) = ([b], [a1]:dump, heap, globals, stats)
+    | otherwise              = error "Negate called with non-number argument"
 
     where (NAp _ b) = hLookup heap a1
           bNode     = hLookup heap b
+
+-- bi argument
+primStep ([_, a1, a2], dump, heap, globals, stats) prim
+    | (NNum n1) <- b1Node, 
+      (NNum n2) <- b2Node  = let heap' = hUpdate heap a2 (NNum (n1 `op` n2))
+                              in ([a2], dump, heap', globals, stats)
+
+    | not (isDataNode b1Node) = ([b1], [a1, a2]:dump, heap, globals, stats)
+    | not (isDataNode b2Node) = ([b2], [a1, a2]:dump, heap, globals, stats)
+    | otherwise               = error "Dyadic arith called with non-number argument"
+
+    where (NAp _ b1) = hLookup heap a1
+          b1Node     = hLookup heap b1
+
+          (NAp _ b2) = hLookup heap a2
+          b2Node     = hLookup heap b2
+
+          op         = case prim of
+                           Add -> (+)
+                           Sub -> (-)
+                           Mul -> (*)
+                           Div -> div
+                           Neg -> error "Programming error: dyadic arith expected"
 
 primStep _ _ = error "Not yet implemented or arguments error"
 
