@@ -92,7 +92,7 @@ pExprAnd  = pThen assembleOp pExprRel pExprAndC
 pExprAndC = pThen FoundOp (pLit "&") pExprAnd `pAlt` (pEmpty NoOp)
 
 relOps :: [String]
-relOps = [ "<", "<=", "==", "~=", ">=", ">" ]
+relOps = [ "<", "<=", "==", "/=", ">=", ">" ]
 
 pRelOp :: Parser String
 pRelOp = pSat (`elem` relOps)

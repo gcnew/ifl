@@ -7,7 +7,7 @@ import Data.Char (isDigit, isAlpha)
 type Token = (Int, String) -- Atoken is never empty
 
 twoCharOps :: [String]
-twoCharOps = ["==", "?=", ">=", "<=", "->"]
+twoCharOps = ["==", "/=", ">=", "<=", "->"]
 
 clex :: Int -> String -> [Token]
 clex _ [] = []
@@ -32,7 +32,7 @@ clex ln (c:cs) | isAlpha c = (ln, varTok) : clex ln rest
 clex ln (c:cs) = (ln, [c]) : clex ln cs
 
 isIdChar :: Char -> Bool
-isIdChar c = isAlpha c || isDigit c || (c == '_') 
+isIdChar c = isAlpha c || isDigit c || (c == '_')
 
 isWhiteSpace :: Char -> Bool
 isWhiteSpace = (`elem` " \t\n")
