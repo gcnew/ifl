@@ -21,5 +21,16 @@ preludeDefs = parseDefs [
         "twice f = compose f f"
     ]
 
+extraPreludeDefs :: CoreProgram
+extraPreludeDefs = parseDefs [
+        "False = Pack{1,0}",
+        "True = Pack{2,0}",
+
+        "and x y = if x y False",
+        "or x y = if x True y",
+        "xor x y = and (or x y) (or (not x) (not y))",
+        "not x = if x False True"
+    ]
+
 main :: IO ()
 main = putStrLn . pprint $ preludeDefs ++ extraPreludeDefs
