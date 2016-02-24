@@ -304,10 +304,8 @@ primDyadic _ _ = error "Dyadic func: invalid arguments count"
 
 primArith :: TiState -> (Int -> Int -> Int) -> TiState
 primArith state op = primDyadic state liftedOp
-    where liftedOp node1 node2
-              | (NNum n1) <- node1,
-                (NNum n2) <- node2  = NNum (n1 `op` n2)
-              | otherwise           = error "Dyadic arith called with non-number argument"
+    where liftedOp (NNum n1) (NNum n2) = NNum (n1 `op` n2)
+          liftedOp _ _  = error "Dyadic arith called with non-number argument"
 
 primComp :: TiState -> (Int -> Int -> Bool) -> TiState
 primComp state@(_, _, heap, globals, _) op = primDyadic state liftedOp
@@ -318,11 +316,9 @@ primComp state@(_, _, heap, globals, _) op = primDyadic state liftedOp
           findPrimDef prim = hLookup heap (aLookup globals prim err)
               where err = error $ "Primitive definition `" ++ prim ++ "` not found!"
 
-          liftedOp node1 node2
-              -- todo: compare NData..
-              | (NNum x) <- node1,
-                (NNum y) <- node2  = cmp x y
-              | otherwise           = error "Compare called with non-data argument"
+          -- todo: compare NData..
+          liftedOp (NNum x) (NNum y) = x `cmp` y
+          liftedOp _ _  = error "Compare called with non-data argument"
 
 coreIsTrue :: Node -> Bool
 coreIsTrue (NData 2 []) = True
