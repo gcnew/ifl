@@ -260,7 +260,7 @@ primStep stack LessEq    = primComp stack (<=)
 primStep stack Eq        = primComp stack (==)
 primStep stack NotEq     = primComp stack (/=)
 
-primStep stack If          = undefined
+primStep stack If          = primIf stack
 primStep stack (PrimConstr tag arity) = primConstr stack tag arity
 
 -- Negate:
@@ -324,10 +324,29 @@ primComp state@(_, _, heap, globals, _) op = primDyadic state liftedOp
                 (NNum y) <- node2  = cmp x y
               | otherwise           = error "Compare called with non-data argument"
 
+coreIsTrue :: Node -> Bool
+coreIsTrue (NData 2 []) = True
+coreIsTrue (NData 1 []) = False
+coreIsTrue _            = error "Not a boolean"
+
+primIf :: TiState -> TiState
+primIf (stack, dump, heap, globals, stats)
+    | length stack /= 4      = error "Primitive If: invalid arguments count:\n"
+
+    | not (isDataNode nCond) = ([aCond], stack:dump, heap, globals, stats)
+    | otherwise              = ([root], dump, heap', globals, stats)
+
+    where root            = last stack
+          args@(aCond:_)  = getargs heap stack
+          [nCond, nT, nF] = map (hLookup heap) args
+
+          heap' | coreIsTrue nCond = hUpdate heap root nT
+                | otherwise        = hUpdate heap root nF
+
 primConstr :: TiState -> Int -> Int -> TiState
-primConstr (stack, dump, heap, globals, env) tag arity
+primConstr (stack, dump, heap, globals, stats) tag arity
     | length stack - 1 /= arity = error "Constructor applied to different arguments count than expected"
-    | otherwise  = ([root], dump, heap', globals, env)
+    | otherwise  = ([root], dump, heap', globals, stats)
 
     where root = last stack
           heap' = hUpdate heap root $ NData tag (getargs heap stack)
