@@ -1,0 +1,2 @@
+a x y = x + y;
+main = fst (MkPair a 4) 4 5

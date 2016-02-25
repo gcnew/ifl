@@ -23,6 +23,10 @@ preludeDefs = parseDefs [
 
 extraPreludeDefs :: CoreProgram
 extraPreludeDefs = parseDefs [
+        "MkPair = Pack{1,2}",
+        "fst p = casePair p K",
+        "snd p = casePair p K1",
+
         "False = Pack{1,0}",
         "True = Pack{2,0}",
 

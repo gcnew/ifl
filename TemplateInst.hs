@@ -18,6 +18,7 @@ type TiState = (TiStack, TiDump, TiHeap, TiGlobals, TiStats)
 data Primitive = Neg | Add | Sub | Mul | Div
                | Greater | GreaterEq | Less | LessEq | Eq | NotEq
                | If
+               | PrimCasePair
                | PrimConstr Int Int
 
 
@@ -51,7 +52,8 @@ primitives = [ ("negate", Neg),
                ("<", Less),    ("<=", LessEq),
                ("==", Eq),     ("/=", NotEq),
 
-               ("if", If) ]
+               ("if", If),
+               ("casePair", PrimCasePair) ]
 
 initialTiDump :: TiDump
 initialTiDump = []
@@ -276,7 +278,8 @@ primStep stack LessEq    = primComp stack (<=)
 primStep stack Eq        = primComp stack (==)
 primStep stack NotEq     = primComp stack (/=)
 
-primStep stack If          = primIf stack
+primStep stack If           = primIf stack
+primStep stack PrimCasePair = primCasePair stack
 primStep stack (PrimConstr tag arity) = primConstr stack tag arity
 
 -- Negate:
@@ -361,6 +364,28 @@ primIf (stack, dump, heap, globals, stats)
     where args  = getargs heap stack
           aCond = head args
           nCond = hLookup heap aCond
+
+primCasePair :: TiState -> TiState
+primCasePair (stack, dump, heap, globals, stats)
+    | length stack < 3       = error "Primitive CasePair: invalid arguments count"
+
+    | not (isDataNode nPair) = let stack' = tail stack;
+                                in ([aPair], stack':dump, heap, globals, stats)
+
+    | otherwise              = let stack' = drop 2 stack;
+                                   root   = head stack';
+
+                                   aF                    = args !! 1
+                                   NData 1 [left, right] = nPair
+
+                                   (heap', leftAp) = hAlloc heap (NAp aF left)
+                                   heap''          = hUpdate heap' root $ (NAp leftAp right)
+
+                                in (stack', dump, heap'', globals, stats)
+
+    where args  = getargs heap stack
+          aPair = head args
+          nPair = hLookup heap aPair
 
 primConstr :: TiState -> Int -> Int -> TiState
 primConstr (stack, dump, heap, globals, stats) tag arity
