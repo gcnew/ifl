@@ -18,7 +18,7 @@ type TiState = (TiStack, TiDump, TiHeap, TiGlobals, TiStats)
 data Primitive = Neg | Add | Sub | Mul | Div
                | Greater | GreaterEq | Less | LessEq | Eq | NotEq
                | If
-               | PrimCasePair | PrimCaseList
+               | PrimCasePair | PrimCaseList | PrimAbort
                | PrimConstr Int Int
 
 
@@ -52,7 +52,7 @@ primitives = [ ("negate", Neg),
                ("<", Less),    ("<=", LessEq),
                ("==", Eq),     ("/=", NotEq),
 
-               ("if", If),
+               ("if", If),     ("abort", PrimAbort),
                ("casePair", PrimCasePair),
                ("caseList", PrimCaseList) ]
 
@@ -280,6 +280,7 @@ primStep stack Eq        = primComp stack (==)
 primStep stack NotEq     = primComp stack (/=)
 
 primStep stack If           = primIf stack
+primStep _     PrimAbort    = error "Core: abort"
 primStep stack PrimCasePair = primCasePair stack
 primStep stack PrimCaseList = primCaseList stack
 primStep stack (PrimConstr tag arity) = primConstr stack tag arity

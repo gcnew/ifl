@@ -1,0 +1,3 @@
+list = Cons 3 (Cons 4 Nil);
+
+main = head list + head (tail list)
