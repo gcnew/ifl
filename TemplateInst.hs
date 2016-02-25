@@ -33,6 +33,12 @@ data ShowStateOptions = ShowStateOptions { ssHeap :: Bool
                                          , ssDump :: Bool
                                          }
 
+dbgOpts :: ShowStateOptions
+dbgOpts = ShowStateOptions True True True
+
+compactOpts :: ShowStateOptions
+compactOpts = ShowStateOptions False False False
+
 type TiDump = [TiStack]
 
 primitives :: ASSOC Name Primitive
@@ -148,10 +154,10 @@ eval state = state : restStates
           nextState = doAdmin (step state)
 
 runProg :: String -> String
-runProg = showResults (ShowStateOptions False False False) . eval . compile . parse
+runProg = showResults compactOpts . eval . compile . parse
 
 runDebugProg :: String -> String
-runDebugProg = showResults (ShowStateOptions True True True) . eval . compile . parse
+runDebugProg = showResults dbgOpts . eval . compile . parse
 
 compile :: CoreProgram -> TiState
 compile program = (initialStack, initialTiDump, initialHeap, globals, tiStatInitial)
@@ -177,6 +183,16 @@ allocatePrim heap (name, prim) = (heap', (name, addr))
 
 doAdmin :: TiState -> TiState
 doAdmin state = applyToStats tiStatIncSteps state
+
+-- Debug version
+--doAdmin state = abortIfSteps 100 . wprint $ applyToStats tiStatIncSteps state
+--    where wprint st@(_, _, _, _, steps) = trace info st
+--              where info = iDisplay $ iConcat [ iNum steps, iStr ") ",
+--                                                iIndent $ showState dbgOpts st ]
+
+--          abortIfSteps n st@(_, dump, heap, globals, v)
+--              | n == v    = ([], dump, heap, globals, v)
+--              | otherwise = st
 
 tiFinal :: TiState -> Bool
 tiFinal ([soleAddr], [], heap, _, _)
@@ -327,7 +343,7 @@ coreIsTrue _            = error "Not a boolean"
 
 primIf :: TiState -> TiState
 primIf (stack, dump, heap, globals, stats)
-    | length stack /= 4      = error "Primitive If: invalid arguments count:\n"
+    | length stack /= 4      = error "Primitive If: invalid arguments count"
 
     | not (isDataNode nCond) = ([aCond], stack:dump, heap, globals, stats)
     | otherwise              = ([root], dump, heap', globals, stats)
