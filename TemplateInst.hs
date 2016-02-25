@@ -2,6 +2,8 @@
 
 module TeamplateInst where
 
+import Data.List (find)
+
 import AST
 import Heap
 import Iseq
@@ -28,6 +30,7 @@ data Node = NAp Addr Addr                    -- Application
           | NInd Addr                        -- Indirection
           | NPrim Name Primitive             -- Primitive
           | NData Int [Addr]                 -- Tag, list of components
+          | NCase [CoreAlt]                  -- List of alternatives
 
 data ShowStateOptions = ShowStateOptions { ssHeap :: Bool
                                          , ssEnv  :: Bool
@@ -132,6 +135,11 @@ showNode (NData tag addrs)     = iConcat [ iStr "NData ", iNum tag, iStr " [",
                                            iInterleave (iStr ", ") $ map showAddr addrs,
                                            iStr "]" ]
 
+showNode (NCase alts)          = iConcat [ iStr "NCase ",
+                                           iInterleave (iStr " | ") $ map showAlt alts ]
+    where showAlt (tag, vars, _) = iConcat [ iStr "<", iNum tag, iStr "> ",
+                                             iInterleave (iStr " ") (map iStr vars) ]
+
 showNode (NPrim name _)        = iStr ("NPrim " ++ name)
 showNode (NSupercomb name _ _) = iStr ("NSupercomb " ++ name)
 
@@ -219,7 +227,9 @@ step state = dispatch (hLookup heap (head stack))
           dispatch (NInd addr)   = indStep state addr
           dispatch (NAp a1 a2)   = apStep state a1 a2
 
+          dispatch (NCase alts)   = caseStep state alts
           dispatch (NPrim _ prim) = primStep state prim
+
           dispatch (NSupercomb sc args body) = scStep state sc args body
 
 -- Number:
@@ -262,6 +272,43 @@ apStep (stack, dump, heap, globals, stats) a1 a2
 
     | otherwise                    = (a1:stack, dump, heap, globals, stats)
 
+caseStep :: TiState -> [CoreAlt] -> TiState
+caseStep (stack, dump, heap, globals, stats) alts
+    | length stack < 2       = error "Core Case: invalid arguments count"
+
+    | not (isDataNode nVal) = ([aVal], stack':dump, heap, globals, stats)
+    | otherwise             = case maybeState of
+                                  Right st -> st
+                                  Left err -> error err
+
+    where (aVal:_) = getargs heap stack
+          nVal = hLookup heap aVal
+
+          stack' = tail stack
+          root   = head stack'
+
+          mkEither (Just x) _ = Right x
+          mkEither Nothing err= Left err
+
+          assert cond err | cond      = Right ()
+                          | otherwise = Left err
+
+          findAlt tag = find (\(tg, _, _) -> tg == tag)
+
+          maybeState = do
+              let NData tag addrs = nVal
+
+              (_, vars, expr) <- mkEither (findAlt tag alts)
+                  $ "Core Case: Constructor not found"
+
+              assert (length vars == length addrs)
+                  $ "Core Case: Var bindings differ from constructor arity"
+
+              let argBindings = zip vars addrs
+              let env = globals ++ argBindings
+              let heap' = instantiateAndUpdate expr root heap env
+
+              return (stack', dump, heap', globals, stats)
 
 primStep :: TiState -> Primitive -> TiState
 
@@ -464,7 +511,10 @@ instantiate (ELet isRec defs body) heap env = instantiate body newHeap newEnv
 
 instantiate (EConstr tag arity) heap _ = hAlloc heap $ NPrim "Constr" (PrimConstr tag arity)
 
-instantiate (ECase _ _) _ _ = error "Can't instantiate case exprs"
+instantiate (ECase expr alts) heap env = hAlloc heap2 (NAp aCase e)
+    where (heap1, e)     = instantiate expr heap env
+          (heap2, aCase) = hAlloc heap1 (NCase alts)
+
 instantiate (ELam _args _body) _heap _env
     = error "Can't instantiate lambda (should be converted to supercombinator)"
 
@@ -493,6 +543,9 @@ instantiateAndUpdate (ELet isRec defs body) updAddr heap env = instantiateAndUpd
 instantiateAndUpdate (EConstr tag arity) updAddr heap _
     = hUpdate heap updAddr $ NPrim "Constr" (PrimConstr tag arity)
 
-instantiateAndUpdate (ECase _ _) _ _ _ = error "Can't instantiate case exprs"
+instantiateAndUpdate (ECase expr alts) updAddr heap env = hUpdate heap2 updAddr (NAp aCase e)
+    where (heap1, e)     = instantiate expr heap env
+          (heap2, aCase) = hAlloc heap1 (NCase alts)
+
 instantiateAndUpdate (ELam _ _) _ _ _
     = error "Can't instantiate lambda (should be converted to supercombinator)"
