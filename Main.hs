@@ -27,6 +27,11 @@ extraPreludeDefs = parseDefs [
         "fst p = casePair p K",
         "snd p = casePair p K1",
 
+        "Nil = Pack{1,0}",
+        "Cons = Pack{2,2}",
+        "head l = caseList l abort K",
+        "tail l = caseList l abort K1",
+
         "False = Pack{1,0}",
         "True = Pack{2,0}",
 

@@ -1,0 +1,4 @@
+a = 1 + 2;
+
+-- a should be reduced to 3
+main = caseList Nil a 4

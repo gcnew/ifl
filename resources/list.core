@@ -1,0 +1,6 @@
+length xs = caseList xs 0 length_;
+length_ x xs = 1 + length xs;
+
+list = Cons 1 (Cons 2 (Cons 3 (Cons 4 (Cons 5 Nil))));
+
+main = length list

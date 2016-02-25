@@ -18,7 +18,7 @@ type TiState = (TiStack, TiDump, TiHeap, TiGlobals, TiStats)
 data Primitive = Neg | Add | Sub | Mul | Div
                | Greater | GreaterEq | Less | LessEq | Eq | NotEq
                | If
-               | PrimCasePair
+               | PrimCasePair | PrimCaseList
                | PrimConstr Int Int
 
 
@@ -53,7 +53,8 @@ primitives = [ ("negate", Neg),
                ("==", Eq),     ("/=", NotEq),
 
                ("if", If),
-               ("casePair", PrimCasePair) ]
+               ("casePair", PrimCasePair),
+               ("caseList", PrimCaseList) ]
 
 initialTiDump :: TiDump
 initialTiDump = []
@@ -280,6 +281,7 @@ primStep stack NotEq     = primComp stack (/=)
 
 primStep stack If           = primIf stack
 primStep stack PrimCasePair = primCasePair stack
+primStep stack PrimCaseList = primCaseList stack
 primStep stack (PrimConstr tag arity) = primConstr stack tag arity
 
 -- Negate:
@@ -379,13 +381,40 @@ primCasePair (stack, dump, heap, globals, stats)
                                    NData 1 [left, right] = nPair
 
                                    (heap', leftAp) = hAlloc heap (NAp aF left)
-                                   heap''          = hUpdate heap' root $ (NAp leftAp right)
+                                   heap''          = hUpdate heap' root (NAp leftAp right)
 
                                 in (stack', dump, heap'', globals, stats)
 
     where args  = getargs heap stack
           aPair = head args
           nPair = hLookup heap aPair
+
+primCaseList :: TiState -> TiState
+primCaseList (stack, dump, heap, globals, stats)
+    | length stack < 4       = error "Primitive CaseList: invalid arguments count"
+
+    | not (isDataNode nList) = let stack' = tail stack;
+                                in ([aList], stack':dump, heap, globals, stats)
+
+    | otherwise              = let stack' = drop 3 stack;
+                                   root   = head stack';
+
+                                   aCn           = args !! 1;
+                                   aCc           = args !! 2;
+
+                                   NData tag dta    = nList;
+                                   heap' | tag == 1 = hUpdate heap root $ NInd aCn -- nInd
+                                         | tag == 2,
+                                           [hd, tl] <- dta = let (heap'', hdAp) = hAlloc heap (NAp aCc hd)
+                                                              in hUpdate heap'' root (NAp hdAp tl)
+                                         | otherwise = error "Error matching list: not a list"
+
+                                in (stack', dump, heap', globals, stats)
+
+    where args  = getargs heap stack
+          aList = head args
+          nList = hLookup heap aList
+
 
 primConstr :: TiState -> Int -> Int -> TiState
 primConstr (stack, dump, heap, globals, stats) tag arity
