@@ -343,22 +343,28 @@ coreIsTrue _            = error "Not a boolean"
 
 primIf :: TiState -> TiState
 primIf (stack, dump, heap, globals, stats)
-    | length stack /= 4      = error "Primitive If: invalid arguments count"
+    | length stack < 4       = error "Primitive If: invalid arguments count"
 
-    | not (isDataNode nCond) = ([aCond], stack':dump, heap, globals, stats)
-    | otherwise              = ([root], dump, heap', globals, stats)
+    | not (isDataNode nCond) = let stack' = tail stack; -- reevaluate cond (takes care for NInd)
+                                in ([aCond], stack':dump, heap, globals, stats)
 
-    where root            = last stack
-          stack'          = tail stack -- reevaluate cond (takes care for NInd)
-          [aCond, aT, aF] = getargs heap stack
-          nCond           = hLookup heap aCond
+    | otherwise              = let stack' = drop 3 stack;
+                                   root   = head stack';
 
-          heap' | coreIsTrue nCond = hUpdate heap root $ NInd aT
-                | otherwise        = hUpdate heap root $ NInd aF
+                                   aRes | coreIsTrue nCond = args !! 1
+                                        | otherwise        = args !! 2
+
+                                   heap' = hUpdate heap root $ NInd aRes
+
+                                in (stack', dump, heap', globals, stats)
+
+    where args  = getargs heap stack
+          aCond = head args
+          nCond = hLookup heap aCond
 
 primConstr :: TiState -> Int -> Int -> TiState
 primConstr (stack, dump, heap, globals, stats) tag arity
-    | length stack - 1 /= arity = error "Constructor applied to different arguments count than expected"
+    | length stack /= arity + 1= error "Primitive Constr: invalid arguments count"
     | otherwise  = ([root], dump, heap', globals, stats)
 
     where root = last stack
