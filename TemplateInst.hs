@@ -305,7 +305,7 @@ negStep _ = error "Negate: invalid arguments count"
 primDyadic :: TiState -> (Node -> Node -> Node) -> TiState
 primDyadic ([_, a1, a2], dump, heap, globals, stats) op
     | not (isDataNode b1Node) = ([b1], [a1, a2]:dump, heap, globals, stats)
-    | not (isDataNode b2Node) = ([b2], [a1, a2]:dump, heap, globals, stats)
+    | not (isDataNode b2Node) = ([b2],     [a2]:dump, heap, globals, stats)
 
     | otherwise               = let heap' = hUpdate heap a2 (b1Node `op` b2Node)
                                  in ([a2], dump, heap', globals, stats)
@@ -324,12 +324,12 @@ primArith state op = primDyadic state liftedOp
           liftedOp _ _  = error "Dyadic arith called with non-number argument"
 
 primComp :: TiState -> (Int -> Int -> Bool) -> TiState
-primComp state@(_, _, heap, globals, _) op = primDyadic state liftedOp
+primComp state@(_, _, _, globals, _) op = primDyadic state liftedOp
     where cmp x y
               | x `op` y  = findPrimDef "True"
               | otherwise = findPrimDef "False"
 
-          findPrimDef prim = hLookup heap (aLookup globals prim err)
+          findPrimDef prim = NInd (aLookup globals prim err)
               where err = error $ "Primitive definition `" ++ prim ++ "` not found!"
 
           -- todo: compare NData..
@@ -345,15 +345,16 @@ primIf :: TiState -> TiState
 primIf (stack, dump, heap, globals, stats)
     | length stack /= 4      = error "Primitive If: invalid arguments count"
 
-    | not (isDataNode nCond) = ([aCond], stack:dump, heap, globals, stats)
+    | not (isDataNode nCond) = ([aCond], stack':dump, heap, globals, stats)
     | otherwise              = ([root], dump, heap', globals, stats)
 
     where root            = last stack
-          args@(aCond:_)  = getargs heap stack
-          [nCond, nT, nF] = map (hLookup heap) args
+          stack'          = tail stack -- reevaluate cond (takes care for NInd)
+          [aCond, aT, aF] = getargs heap stack
+          nCond           = hLookup heap aCond
 
-          heap' | coreIsTrue nCond = hUpdate heap root nT
-                | otherwise        = hUpdate heap root nF
+          heap' | coreIsTrue nCond = hUpdate heap root $ NInd aT
+                | otherwise        = hUpdate heap root $ NInd aF
 
 primConstr :: TiState -> Int -> Int -> TiState
 primConstr (stack, dump, heap, globals, stats) tag arity
