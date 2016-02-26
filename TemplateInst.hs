@@ -19,18 +19,17 @@ type TiState = (TiStack, TiDump, TiHeap, TiGlobals, TiStats)
 
 data Primitive = Neg | Add | Sub | Mul | Div
                | Greater | GreaterEq | Less | LessEq | Eq | NotEq
-               | If
-               | PrimCasePair | PrimCaseList | PrimAbort
+               | PrimAbort
                | PrimConstr Int Int
 
 
-data Node = NAp Addr Addr                    -- Application
-          | NSupercomb Name [Name] CoreExpr  -- Supercombinator
-          | NNum Int                         -- A number
-          | NInd Addr                        -- Indirection
-          | NPrim Name Primitive             -- Primitive
-          | NData Int [Addr]                 -- Tag, list of components
-          | NCase [CoreAlt]                  -- List of alternatives
+data Node = NAp Addr Addr                        -- Application
+          | NSupercomb Name [Name] CoreExpr      -- Supercombinator
+          | NNum Int                             -- A number
+          | NInd Addr                            -- Indirection
+          | NPrim Name Primitive                 -- Primitive
+          | NData Int [Addr]                     -- Tag, list of components
+          | NCase [(Int, [(Name, Addr)], Addr)]  -- List of alternatives
 
 data ShowStateOptions = ShowStateOptions { ssHeap :: Bool
                                          , ssEnv  :: Bool
@@ -55,9 +54,7 @@ primitives = [ ("negate", Neg),
                ("<", Less),    ("<=", LessEq),
                ("==", Eq),     ("/=", NotEq),
 
-               ("if", If),     ("abort", PrimAbort),
-               ("casePair", PrimCasePair),
-               ("caseList", PrimCaseList) ]
+               ("abort", PrimAbort) ]
 
 initialTiDump :: TiDump
 initialTiDump = []
@@ -138,7 +135,7 @@ showNode (NData tag addrs)     = iConcat [ iStr "NData ", iNum tag, iStr " [",
 showNode (NCase alts)          = iConcat [ iStr "NCase ",
                                            iInterleave (iStr " | ") $ map showAlt alts ]
     where showAlt (tag, vars, _) = iConcat [ iStr "<", iNum tag, iStr "> ",
-                                             iInterleave (iStr " ") (map iStr vars) ]
+                                             iInterleave (iStr " ") (map (iStr . fst) vars) ]
 
 showNode (NPrim name _)        = iStr ("NPrim " ++ name)
 showNode (NSupercomb name _ _) = iStr ("NSupercomb " ++ name)
@@ -272,7 +269,7 @@ apStep (stack, dump, heap, globals, stats) a1 a2
 
     | otherwise                    = (a1:stack, dump, heap, globals, stats)
 
-caseStep :: TiState -> [CoreAlt] -> TiState
+caseStep :: TiState -> [(Int, [(Name, Addr)], Addr)] -> TiState
 caseStep (stack, dump, heap, globals, stats) alts
     | length stack < 2       = error "Core Case: invalid arguments count"
 
@@ -298,17 +295,16 @@ caseStep (stack, dump, heap, globals, stats) alts
           maybeState = do
               let NData tag addrs = nVal
 
-              (_, vars, expr) <- mkEither (findAlt tag alts)
+              (_, varPairs, aExpr) <- mkEither (findAlt tag alts)
                   $ "Core Case: Constructor not found"
 
-              assert (length vars == length addrs)
+              assert (length varPairs == length addrs)
                   $ "Core Case: Var bindings differ from constructor arity"
 
-              let argBindings = zip vars addrs
-              let env = globals ++ argBindings
-              let heap' = instantiateAndUpdate expr root heap env
+              let heap'  = foldr (\((_, ref), aData) h -> hUpdate h ref $ NInd aData) heap (zip varPairs addrs)
+              let heap'' = hUpdate heap' root $ NInd aExpr
 
-              return (stack', dump, heap', globals, stats)
+              return (stack', dump, heap'', globals, stats)
 
 primStep :: TiState -> Primitive -> TiState
 
@@ -326,10 +322,7 @@ primStep stack LessEq    = primComp stack (<=)
 primStep stack Eq        = primComp stack (==)
 primStep stack NotEq     = primComp stack (/=)
 
-primStep stack If           = primIf stack
 primStep _     PrimAbort    = error "Core: abort"
-primStep stack PrimCasePair = primCasePair stack
-primStep stack PrimCaseList = primCaseList stack
 primStep stack (PrimConstr tag arity) = primConstr stack tag arity
 
 -- Negate:
@@ -389,81 +382,6 @@ primComp state@(_, _, _, globals, _) op = primDyadic state liftedOp
           liftedOp (NNum x) (NNum y) = x `cmp` y
           liftedOp _ _  = error "Compare called with non-data argument"
 
-coreIsTrue :: Node -> Bool
-coreIsTrue (NData 2 []) = True
-coreIsTrue (NData 1 []) = False
-coreIsTrue _            = error "Not a boolean"
-
-primIf :: TiState -> TiState
-primIf (stack, dump, heap, globals, stats)
-    | length stack < 4       = error "Primitive If: invalid arguments count"
-
-    | not (isDataNode nCond) = let stack' = tail stack; -- reevaluate cond (takes care for NInd)
-                                in ([aCond], stack':dump, heap, globals, stats)
-
-    | otherwise              = let stack' = drop 3 stack;
-                                   root   = head stack';
-
-                                   aRes | coreIsTrue nCond = args !! 1
-                                        | otherwise        = args !! 2
-
-                                   heap' = hUpdate heap root $ NInd aRes
-
-                                in (stack', dump, heap', globals, stats)
-
-    where args  = getargs heap stack
-          aCond = head args
-          nCond = hLookup heap aCond
-
-primCasePair :: TiState -> TiState
-primCasePair (stack, dump, heap, globals, stats)
-    | length stack < 3       = error "Primitive CasePair: invalid arguments count"
-
-    | not (isDataNode nPair) = let stack' = tail stack;
-                                in ([aPair], stack':dump, heap, globals, stats)
-
-    | otherwise              = let stack' = drop 2 stack;
-                                   root   = head stack';
-
-                                   aF                    = args !! 1
-                                   NData 1 [left, right] = nPair
-
-                                   (heap', leftAp) = hAlloc heap (NAp aF left)
-                                   heap''          = hUpdate heap' root (NAp leftAp right)
-
-                                in (stack', dump, heap'', globals, stats)
-
-    where args  = getargs heap stack
-          aPair = head args
-          nPair = hLookup heap aPair
-
-primCaseList :: TiState -> TiState
-primCaseList (stack, dump, heap, globals, stats)
-    | length stack < 4       = error "Primitive CaseList: invalid arguments count"
-
-    | not (isDataNode nList) = let stack' = tail stack;
-                                in ([aList], stack':dump, heap, globals, stats)
-
-    | otherwise              = let stack' = drop 3 stack;
-                                   root   = head stack';
-
-                                   aCn           = args !! 1;
-                                   aCc           = args !! 2;
-
-                                   NData tag dta    = nList;
-                                   heap' | tag == 1 = hUpdate heap root $ NInd aCn -- nInd
-                                         | tag == 2,
-                                           [hd, tl] <- dta = let (heap'', hdAp) = hAlloc heap (NAp aCc hd)
-                                                              in hUpdate heap'' root (NAp hdAp tl)
-                                         | otherwise = error "Error matching list: not a list"
-
-                                in (stack', dump, heap', globals, stats)
-
-    where args  = getargs heap stack
-          aList = head args
-          nList = hLookup heap aList
-
-
 primConstr :: TiState -> Int -> Int -> TiState
 primConstr (stack, dump, heap, globals, stats) tag arity
     | length stack /= arity + 1= error "Primitive Constr: invalid arguments count"
@@ -511,12 +429,25 @@ instantiate (ELet isRec defs body) heap env = instantiate body newHeap newEnv
 
 instantiate (EConstr tag arity) heap _ = hAlloc heap $ NPrim "Constr" (PrimConstr tag arity)
 
-instantiate (ECase expr alts) heap env = hAlloc heap2 (NAp aCase e)
+instantiate (ECase expr alts) heap env = hAlloc heap3 (NAp aCase e)
     where (heap1, e)     = instantiate expr heap env
-          (heap2, aCase) = hAlloc heap1 (NCase alts)
+          (heap2, cases) = mapAccuml (allocCase env) heap1 alts
+          (heap3, aCase) = hAlloc heap2 (NCase cases)
 
 instantiate (ELam _args _body) _heap _env
     = error "Can't instantiate lambda (should be converted to supercombinator)"
+
+dummyNode :: Node
+dummyNode = NPrim "Dummy" PrimAbort
+
+allocVar :: TiHeap -> Name -> (TiHeap, (Name, Addr))
+allocVar heap var = (heap', (var, addr))
+  where (heap', addr) = hAlloc heap dummyNode
+
+allocCase :: ASSOC Name Addr -> TiHeap -> CoreAlt -> (TiHeap, (Int, [(Name, Addr)], Addr))
+allocCase env heap (tag, vars, expr) = (heap'', (tag, varPairs, expr'))
+  where (heap', varPairs) = mapAccuml allocVar heap vars
+        (heap'', expr')   = instantiate expr heap' (varPairs ++ env)
 
 instantiateAndUpdate :: CoreExpr            -- Body of supercombinator
                         -> Addr
@@ -543,9 +474,10 @@ instantiateAndUpdate (ELet isRec defs body) updAddr heap env = instantiateAndUpd
 instantiateAndUpdate (EConstr tag arity) updAddr heap _
     = hUpdate heap updAddr $ NPrim "Constr" (PrimConstr tag arity)
 
-instantiateAndUpdate (ECase expr alts) updAddr heap env = hUpdate heap2 updAddr (NAp aCase e)
+instantiateAndUpdate (ECase expr alts) updAddr heap env = hUpdate heap3 updAddr (NAp aCase e)
     where (heap1, e)     = instantiate expr heap env
-          (heap2, aCase) = hAlloc heap1 (NCase alts)
+          (heap2, cases) = mapAccuml (allocCase env) heap1 alts
+          (heap3, aCase) = hAlloc heap2 (NCase cases)
 
 instantiateAndUpdate (ELam _ _) _ _ _
     = error "Can't instantiate lambda (should be converted to supercombinator)"
