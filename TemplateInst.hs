@@ -15,12 +15,7 @@ type TiGlobals = ASSOC Name Addr
 
 type TiState = (TiStack, TiDump, TiHeap, TiGlobals, TiStats)
 
-data Primitive = Neg | Add | Sub | Mul | Div
-               | Greater | GreaterEq | Less | LessEq | Eq | NotEq
-               | If
-               | PrimCasePair | PrimCaseList | PrimAbort
-               | PrimConstr Int Int
-
+type Primitive = TiState -> TiState
 
 data Node = NAp Addr Addr                    -- Application
           | NSupercomb Name [Name] CoreExpr  -- Supercombinator
@@ -43,18 +38,19 @@ compactOpts = ShowStateOptions False False False
 type TiDump = [TiStack]
 
 primitives :: ASSOC Name Primitive
-primitives = [ ("negate", Neg),
 
-               ("+", Add), ("-", Sub),
-               ("*", Mul), ("/", Div),
+primitives = [ ("negate", negStep),
 
-               (">", Greater), (">=", GreaterEq),
-               ("<", Less),    ("<=", LessEq),
-               ("==", Eq),     ("/=", NotEq),
+               ("+", primArith (+)), ("-", primArith (-)),
+               ("*", primArith (*)), ("/", primArith div),
 
-               ("if", If),     ("abort", PrimAbort),
-               ("casePair", PrimCasePair),
-               ("caseList", PrimCaseList) ]
+               (">", primComp (>)),   (">=", primComp (>=)),
+               ("<", primComp (<)),   ("<=", primComp (<=)),
+               ("==", primComp (==)), ("/=", primComp (/=)),
+
+               ("if", primIf),     ("abort", primAbort),
+               ("casePair", primCasePair),
+               ("caseList", primCaseList) ]
 
 initialTiDump :: TiDump
 initialTiDump = []
@@ -219,7 +215,7 @@ step state = dispatch (hLookup heap (head stack))
           dispatch (NInd addr)   = indStep state addr
           dispatch (NAp a1 a2)   = apStep state a1 a2
 
-          dispatch (NPrim _ prim) = primStep state prim
+          dispatch (NPrim _ prim) = prim state
           dispatch (NSupercomb sc args body) = scStep state sc args body
 
 -- Number:
@@ -262,29 +258,6 @@ apStep (stack, dump, heap, globals, stats) a1 a2
 
     | otherwise                    = (a1:stack, dump, heap, globals, stats)
 
-
-primStep :: TiState -> Primitive -> TiState
-
-primStep stack Neg = negStep stack
-
-primStep stack Add = primArith stack (+)
-primStep stack Sub = primArith stack (-)
-primStep stack Mul = primArith stack (*)
-primStep stack Div = primArith stack div
-
-primStep stack Greater   = primComp stack (>)
-primStep stack GreaterEq = primComp stack (>=)
-primStep stack Less      = primComp stack (<)
-primStep stack LessEq    = primComp stack (<=)
-primStep stack Eq        = primComp stack (==)
-primStep stack NotEq     = primComp stack (/=)
-
-primStep stack If           = primIf stack
-primStep _     PrimAbort    = error "Core: abort"
-primStep stack PrimCasePair = primCasePair stack
-primStep stack PrimCaseList = primCaseList stack
-primStep stack (PrimConstr tag arity) = primConstr stack tag arity
-
 -- Negate:
 --    a:a1:[]   d   h┌ a:  NPrim Neg ┐   f
 --                   │ a1: NAp a b   │
@@ -308,6 +281,9 @@ negStep ([_, a1], dump, heap, globals, stats)
 
 negStep _ = error "Negate: invalid arguments count"
 
+primAbort :: TiState -> TiState
+primAbort _ = error "Core: abort"
+
 primDyadic :: TiState -> (Node -> Node -> Node) -> TiState
 primDyadic ([_, a1, a2], dump, heap, globals, stats) op
     | not (isDataNode b1Node) = ([b1], [a1, a2]:dump, heap, globals, stats)
@@ -324,13 +300,13 @@ primDyadic ([_, a1, a2], dump, heap, globals, stats) op
 
 primDyadic _ _ = error "Dyadic func: invalid arguments count"
 
-primArith :: TiState -> (Int -> Int -> Int) -> TiState
-primArith state op = primDyadic state liftedOp
+primArith :: (Int -> Int -> Int) -> TiState -> TiState
+primArith op state = primDyadic state liftedOp
     where liftedOp (NNum n1) (NNum n2) = NNum (n1 `op` n2)
           liftedOp _ _  = error "Dyadic arith called with non-number argument"
 
-primComp :: TiState -> (Int -> Int -> Bool) -> TiState
-primComp state@(_, _, _, globals, _) op = primDyadic state liftedOp
+primComp :: (Int -> Int -> Bool) -> TiState -> TiState
+primComp op state@(_, _, _, globals, _) = primDyadic state liftedOp
     where cmp x y
               | x `op` y  = findPrimDef "True"
               | otherwise = findPrimDef "False"
@@ -417,8 +393,8 @@ primCaseList (stack, dump, heap, globals, stats)
           nList = hLookup heap aList
 
 
-primConstr :: TiState -> Int -> Int -> TiState
-primConstr (stack, dump, heap, globals, stats) tag arity
+primConstr :: Int -> Int -> TiState -> TiState
+primConstr tag arity (stack, dump, heap, globals, stats)
     | length stack /= arity + 1= error "Primitive Constr: invalid arguments count"
     | otherwise  = ([root], dump, heap', globals, stats)
 
@@ -462,7 +438,7 @@ instantiate (ELet isRec defs body) heap env = instantiate body newHeap newEnv
                                                      in (heap', (name, addr) : curEnv)
           (newHeap, newEnv) = foldl allocDef (heap, env) defs
 
-instantiate (EConstr tag arity) heap _ = hAlloc heap $ NPrim "Constr" (PrimConstr tag arity)
+instantiate (EConstr tag arity) heap _ = hAlloc heap $ NPrim "Constr" (primConstr tag arity)
 
 instantiate (ECase _ _) _ _ = error "Can't instantiate case exprs"
 instantiate (ELam _args _body) _heap _env
@@ -491,7 +467,7 @@ instantiateAndUpdate (ELet isRec defs body) updAddr heap env = instantiateAndUpd
           (newHeap, newEnv) = foldl allocDef (heap, env) defs
 
 instantiateAndUpdate (EConstr tag arity) updAddr heap _
-    = hUpdate heap updAddr $ NPrim "Constr" (PrimConstr tag arity)
+    = hUpdate heap updAddr $ NPrim "Constr" (primConstr tag arity)
 
 instantiateAndUpdate (ECase _ _) _ _ _ = error "Can't instantiate case exprs"
 instantiateAndUpdate (ELam _ _) _ _ _
