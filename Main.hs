@@ -32,6 +32,10 @@ extraPreludeDefs = parseDefs [
         "head l = caseList l abort K",
         "tail l = caseList l abort K1",
 
+        "Unit = Pack{1,0}",
+        "printList xs  = caseList xs Unit printCons",
+        "printCons h t = print h (printList t)",
+
         "False = Pack{1,0}",
         "True = Pack{2,0}",
 
