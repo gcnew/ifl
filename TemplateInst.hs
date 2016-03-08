@@ -10,6 +10,7 @@ import Parser (parse)
 import Main (preludeDefs, extraPreludeDefs)
 
 type TiOut = [Int]
+type TiDump = [Int]
 type TiStack = [Addr]
 type TiHeap = Heap Node
 type TiGlobals = ASSOC Name Addr
@@ -35,8 +36,6 @@ dbgOpts = ShowStateOptions True True True
 
 compactOpts :: ShowStateOptions
 compactOpts = ShowStateOptions False False False
-
-type TiDump = [TiStack]
 
 primitives :: ASSOC Name Primitive
 
@@ -88,7 +87,7 @@ showState opts (stack, dump, heap, env, _, _)
           envLines  | ssEnv opts  = showEnv env
                     | otherwise   = iNil
 
-          dumpLines | ssDump opts = showDump heap dump
+          dumpLines | ssDump opts = showDump heap stack dump
                     | otherwise   = iNil
 
           extra | null views = iNil
@@ -103,8 +102,8 @@ showHeap heap = iInterleave iNewline (map formatter tuples)
     where formatter (addr, node) = iConcat [ showFWAddr addr, iStr " -> ", showNode node ]
           tuples =  [ (addr, hLookup heap addr) | addr <- hAddresses heap ]
 
-showDump :: TiHeap -> TiDump -> Iseq
-showDump heap = iInterleave iNewline . map (showStack heap)
+showDump :: TiHeap -> TiStack -> TiDump -> Iseq
+showDump heap stack = iInterleave iNewline . map (showStack heap) . getStacks stack
 
 showEnv :: TiGlobals -> Iseq
 showEnv = iInterleave iNewline . map formatter
@@ -218,28 +217,23 @@ step :: TiState -> TiState
 step state = dispatch (hLookup heap (head stack))
     where (stack, _, heap, _, _, _) = state
 
+          dispatch n@(NNum _)    = dataStep state n
           dispatch d@(NData _ _) = dataStep state d
 
-          dispatch (NNum n)      = numStep state n
           dispatch (NInd addr)   = indStep state addr
           dispatch (NAp a1 a2)   = apStep state a1 a2
 
           dispatch (NPrim _ prim) = prim state
           dispatch (NSupercomb sc args body) = scStep state sc args body
 
--- Number:
+-- Number|Data:
 --    a:[]   s:d   h[ a: NNum n ]   f
 -- ->    s     d   h                f
 
-numStep :: TiState -> Int -> TiState
-numStep ([_], prevStack:dump', heap, globals, out, stats) _
-    = (prevStack, dump', heap, globals, out, stats)
-
-numStep _ _ = error "Number applied as a function!"
-
 dataStep :: TiState -> Node -> TiState
-dataStep ([_], prevStack:dump', heap, globals, out, stats) _
-    = (prevStack, dump', heap, globals, out, stats)
+dataStep (stack, offset:dump', heap, globals, out, stats) _
+    | length stack - offset /= 1  = error "Assert: unexpected stack offset"
+    | otherwise                   = (tail stack, dump', heap, globals, out, stats)
 
 dataStep _ _ = error "Data applied as a function!"
 
@@ -280,36 +274,40 @@ apStep (stack, dump, heap, globals, out, stats) a1 a2
 -- ->    b:[]   (a1:[]):d   h                   f
 
 negStep :: TiState -> TiState
-negStep ([_, a1], dump, heap, globals, out, stats)
-    | (NNum n) <- bNode = let heap' = hUpdate heap a1 (NNum (negate n))
-                           in ([a1], dump, heap', globals, out, stats)
+negStep (stack, dump, heap, globals, out, stats)
+    | length args /= 1       = error "Primitive Negate: invalid arguments count"
 
-    | not (isDataNode bNode) = ([b], [a1]:dump, heap, globals, out, stats)
-    | otherwise              = error "Negate called with non-number argument"
+    | not (isDataNode bNode) = let (stack', dump') = newStack stack dump 1 [b]
+                                in (stack', dump', heap, globals, out, stats)
 
-    where (NAp _ b) = hLookup heap a1
-          bNode     = hLookup heap b
+    | (NNum n) <- bNode      = let (stack', heap') = pruneStack stack heap 1 (NNum (negate n))
+                                in (stack', dump, heap', globals, out, stats)
 
-negStep _ = error "Negate: invalid arguments count"
+    | otherwise              = error "Primitive Negate: non-number argument"
+
+    where args  = getargs heap stack dump
+          (b:_) = args
+          bNode = hLookup heap b
 
 primAbort :: TiState -> TiState
 primAbort _ = error "Core: abort"
 
 primDyadic :: TiState -> (Node -> Node -> Node) -> TiState
-primDyadic ([_, a1, a2], dump, heap, globals, out, stats) op
-    | not (isDataNode b1Node) = ([b1], [a1, a2]:dump, heap, globals, out, stats)
-    | not (isDataNode b2Node) = ([b2],     [a2]:dump, heap, globals, out, stats)
+primDyadic (stack, dump, heap, globals, out, stats) op
+    | length args /= 2     = error "Primitive Dyadic: invalid arguments count"
 
-    | otherwise               = let heap' = hUpdate heap a2 (b1Node `op` b2Node)
-                                 in ([a2], dump, heap', globals, out, stats)
+    | not (isDataNode nA1) = let (stack', dump') = newStack stack dump 1 [aA1]
+                              in (stack', dump', heap, globals, out, stats)
 
-    where (NAp _ b1) = hLookup heap a1
-          b1Node     = hLookup heap b1
+    | not (isDataNode nA2) = let (stack', dump') = newStack stack dump 2 [aA2]
+                              in (stack', dump', heap, globals, out, stats)
 
-          (NAp _ b2) = hLookup heap a2
-          b2Node     = hLookup heap b2
+    | otherwise            = let (stack', heap') = pruneStack stack heap 2 (nA1 `op` nA2)
+                              in (stack', dump, heap', globals, out, stats)
 
-primDyadic _ _ = error "Dyadic func: invalid arguments count"
+    where args        = getargs heap stack dump
+          (aA1:aA2:_) = args
+          (nA1:nA2:_) = map (hLookup heap) args
 
 primArith :: (Int -> Int -> Int) -> TiState -> TiState
 primArith op state = primDyadic state liftedOp
@@ -336,118 +334,117 @@ coreIsTrue _            = error "Not a boolean"
 
 primIf :: TiState -> TiState
 primIf (stack, dump, heap, globals, out, stats)
-    | length stack < 4       = error "Primitive If: invalid arguments count"
+    | length args < 3        = error "Primitive If: invalid arguments count"
 
-    | not (isDataNode nCond) = let stack' = tail stack; -- reevaluate cond (takes care for NInd)
-                                in ([aCond], stack':dump, heap, globals, out, stats)
+    | not (isDataNode nCond) = let (stack', dump') = newStack stack dump 1 [aCond]
+                                in (stack', dump', heap, globals, out, stats)
 
-    | otherwise              = let stack' = drop 3 stack;
-                                   root   = head stack';
+    | otherwise              = let aRes | coreIsTrue nCond = aT
+                                        | otherwise        = aF
 
-                                   aRes | coreIsTrue nCond = args !! 1
-                                        | otherwise        = args !! 2
-
-                                   heap' = hUpdate heap root $ NInd aRes
-
+                                   (stack', heap') = pruneStack stack heap 3 (NInd aRes)
                                 in (stack', dump, heap', globals, out, stats)
 
-    where args  = getargs heap stack
-          aCond = head args
-          nCond = hLookup heap aCond
+    where args            = getargs heap stack dump
+          (aCond:aT:aF:_) = args
+          nCond           = hLookup heap aCond
 
 primPrint :: TiState -> TiState
 primPrint (stack, dump, heap, globals, out, stats)
-    | length stack < 3      = error "Primitive Print: invalid arguments count"
+    | length args < 2       = error "Primitive Print: invalid arguments count"
 
-    | not (isDataNode nVal) = let stack' = tail stack
-                               in ([aVal], stack':dump, heap, globals, out, stats)
+    | not (isDataNode nVal) = let (stack', dump') = newStack stack dump 1 [aVal]
+                               in (stack', dump', heap, globals, out, stats)
 
-    | otherwise             = let stack' = drop 2 stack;
-                                  root   = head stack';
-
-                                  (NNum val) = nVal
-
-                                  aRes  = args !! 1
-                                  heap' = hUpdate heap root $ NInd aRes
-
+    | otherwise             = let (NNum val)      = nVal
+                                  (stack', heap') = pruneStack stack heap 2 (NInd aRes)
                                in (stack', dump, heap', globals, val:out, stats)
 
-    where args = getargs heap stack
-          aVal = head args
-          nVal = hLookup heap aVal
-
+    where args          = getargs heap stack dump
+          (aVal:aRes:_) = args
+          nVal          = hLookup heap aVal
 
 primCasePair :: TiState -> TiState
 primCasePair (stack, dump, heap, globals, out, stats)
-    | length stack < 3       = error "Primitive CasePair: invalid arguments count"
+    | length args < 2        = error "Primitive CasePair: invalid arguments count"
 
-    | not (isDataNode nPair) = let stack' = tail stack;
-                                in ([aPair], stack':dump, heap, globals, out, stats)
+    | not (isDataNode nPair) = let (stack', dump') = newStack stack dump 1 [aPair]
+                                in (stack', dump', heap, globals, out, stats)
 
-    | otherwise              = let stack' = drop 2 stack;
-                                   root   = head stack';
-
-                                   aF                    = args !! 1
-                                   NData 1 [left, right] = nPair
-
-                                   (heap', leftAp) = hAlloc heap (NAp aF left)
-                                   heap''          = hUpdate heap' root (NAp leftAp right)
-
+    | otherwise              = let NData 1 [left, right] = nPair
+                                   (heap', leftAp)  = hAlloc heap (NAp aF left)
+                                   (stack', heap'') = pruneStack stack heap' 2 (NAp leftAp right)
                                 in (stack', dump, heap'', globals, out, stats)
 
-    where args  = getargs heap stack
-          aPair = head args
-          nPair = hLookup heap aPair
+    where args         = getargs heap stack dump
+          (aPair:aF:_) = args
+          nPair        = hLookup heap aPair
 
 primCaseList :: TiState -> TiState
 primCaseList (stack, dump, heap, globals, out, stats)
-    | length stack < 4       = error "Primitive CaseList: invalid arguments count"
+    | length args < 3        = error "Primitive CaseList: invalid arguments count"
 
-    | not (isDataNode nList) = let stack' = tail stack;
-                                in ([aList], stack':dump, heap, globals, out, stats)
+    | not (isDataNode nList) = let (stack', dump') = newStack stack dump 1 [aList]
+                                in (stack', dump', heap, globals, out, stats)
 
-    | otherwise              = let stack' = drop 3 stack;
-                                   root   = head stack';
+    | otherwise              = let NData tag dta = nList;
+                                   (heap', node)
+                                        | tag == 1  = (heap, NInd aCn)
+                                        | tag == 2, [hd, tl] <- dta
+                                            = let (hp, hdAp) = hAlloc heap (NAp aCc hd)
+                                               in (hp, NAp hdAp tl)
+                                        | otherwise = error "Error matching list: not a list"
 
-                                   aCn           = args !! 1;
-                                   aCc           = args !! 2;
+                                   (stack', heap'') = pruneStack stack heap' 3 node
+                                in (stack', dump, heap'', globals, out, stats)
 
-                                   NData tag dta    = nList;
-                                   heap' | tag == 1 = hUpdate heap root $ NInd aCn -- nInd
-                                         | tag == 2,
-                                           [hd, tl] <- dta = let (heap'', hdAp) = hAlloc heap (NAp aCc hd)
-                                                              in hUpdate heap'' root (NAp hdAp tl)
-                                         | otherwise = error "Error matching list: not a list"
-
-                                in (stack', dump, heap', globals, out, stats)
-
-    where args  = getargs heap stack
-          aList = head args
-          nList = hLookup heap aList
+    where args              = getargs heap stack dump
+          (aList:aCn:aCc:_) = args
+          nList             = hLookup heap aList
 
 
 primConstr :: Int -> Int -> TiState -> TiState
 primConstr tag arity (stack, dump, heap, globals, out, stats)
-    | length stack /= arity + 1= error "Primitive Constr: invalid arguments count"
-    | otherwise  = ([root], dump, heap', globals, out, stats)
+    | length args /= arity = error "Primitive Constr: invalid arguments count"
+    | otherwise            = (stack', dump, heap', globals, out, stats)
 
-    where root = last stack
-          heap' = hUpdate heap root $ NData tag (getargs heap stack)
+    where args = getargs heap stack dump
+          stack' = drop arity stack
+          root = head stack'
+          heap' = hUpdate heap root $ NData tag args
 
 scStep :: TiState -> Name -> [Name] -> CoreExpr -> TiState
 scStep (stack, dump, heap, globals, out, stats) _ argNames body
-    | length stack < length argNames + 1 = error $ "Insufficient number of arguments"
-    | otherwise                          = (newStack, dump, newHeap, globals, out, stats)
+    | length args < length argNames = error "Insufficient number of arguments"
+    | otherwise                     = (stack', dump, heap', globals, out, stats)
 
-    where newStack@(rdxRoot:_) = drop (length argNames) stack
-          newHeap = instantiateAndUpdate body rdxRoot heap env
+    where stack' = drop (length argNames) stack
+          root = head stack'
+          heap' = instantiateAndUpdate body root heap env
           env = argBindings ++ globals
-          argBindings = zip argNames (getargs heap stack)
+          args = getargs heap stack dump
+          argBindings = zip argNames args
 
-getargs :: TiHeap -> TiStack -> [Addr]
-getargs heap stack = map getarg (tail stack) -- skip the supercombinator
-    where getarg addr = let (NAp _ arg) = hLookup heap addr
+getargs :: TiHeap -> TiStack -> TiDump -> [Addr]
+getargs heap stack dump = map getarg (tail topStack) -- skip the supercombinator
+    where topStack = head (getStacks stack dump)
+
+          getarg addr = let (NAp _ arg) = hLookup heap addr
                          in arg
+
+getStacks :: TiStack -> TiDump -> [TiStack]
+getStacks stack dump = splitStacks stack (length stack:dump)
+    where splitStacks s [_]       = [s]
+          splitStacks s (x:y:rst) = (take (x - y) s) : (splitStacks (drop (x - y) s) (y:rst))
+          splitStacks _ _         = error "Assert: never"
+
+newStack :: TiStack -> TiDump -> Int -> [Addr] -> (TiStack, TiDump)
+newStack stack dump pruneCount toBeStack = (toBeStack ++ pruned, (length pruned):dump)
+    where pruned = drop pruneCount stack
+
+pruneStack :: TiStack -> TiHeap -> Int -> Node -> (TiStack, TiHeap)
+pruneStack stack heap dropCount node = (pruned, hUpdate heap root node)
+    where pruned@(root:_) = drop dropCount stack
 
 instantiate :: CoreExpr             -- Body of supercombinator
                 -> TiHeap           -- Heap before instantiation
@@ -478,7 +475,7 @@ instantiate (ELam _args _body) _heap _env
     = error "Can't instantiate lambda (should be converted to supercombinator)"
 
 instantiateAndUpdate :: CoreExpr            -- Body of supercombinator
-                        -> Addr
+                        -> Addr             -- Address of root
                         -> TiHeap           -- Heap before instantiation
                         -> ASSOC Name Addr  -- Association of names to addresses
                         -> TiHeap           -- Heap after instantiation
