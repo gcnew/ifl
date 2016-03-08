@@ -13,6 +13,7 @@ type TiOut = [Int]
 type TiDump = [Int]
 type TiStack = [Addr]
 type TiHeap = Heap Node
+type TiStats = (Int, Int)
 type TiGlobals = ASSOC Name Addr
 
 type TiState = (TiStack, TiDump, TiHeap, TiGlobals, TiOut, TiStats)
@@ -25,6 +26,7 @@ data Node = NAp Addr Addr                    -- Application
           | NInd Addr                        -- Indirection
           | NPrim Name Primitive             -- Primitive
           | NData Int [Addr]                 -- Tag, list of components
+          | NMarked Node                     -- Marked node
 
 data ShowStateOptions = ShowStateOptions { ssHeap :: Bool
                                          , ssEnv  :: Bool
@@ -57,16 +59,20 @@ primitives = [ ("negate", negStep),
 initialTiDump :: TiDump
 initialTiDump = []
 
-type TiStats = Int
-
 tiStatInitial :: TiStats
-tiStatInitial = 0
+tiStatInitial = (0, 0)
 
 tiStatIncSteps :: TiStats -> TiStats
-tiStatIncSteps s = s + 1
+tiStatIncSteps (s, gcs) = (s + 1, gcs)
 
 tiStatGetSteps :: TiStats -> Int
-tiStatGetSteps s = s
+tiStatGetSteps (s, _) = s
+
+tiStatIncGC :: TiStats -> TiStats
+tiStatIncGC (s, gcs) = (s, gcs + 1)
+
+tiStatGetGC :: TiStats -> Int
+tiStatGetGC (_, gcs) = gcs
 
 applyToStats :: (TiStats -> TiStats) -> TiState -> TiState
 applyToStats statsFun (stack, dump, heap, scDefs, out, stats)
@@ -80,7 +86,9 @@ showResults opts states = iDisplay $ iConcat [ iLayn (map (showState opts) state
 
 showState :: ShowStateOptions -> TiState -> Iseq
 showState opts (stack, dump, heap, env, _, _)
-    = iConcat [ showStack heap stack, iNewline, extra ]
+    = iConcat [ showHeapSize heap, iNewline,
+                showStack heap stack, iNewline, extra ]
+
     where heapLines | ssHeap opts = showHeap heap
                     | otherwise   = iNil
 
@@ -101,6 +109,9 @@ showHeap :: TiHeap -> Iseq
 showHeap heap = iInterleave iNewline (map formatter tuples)
     where formatter (addr, node) = iConcat [ showFWAddr addr, iStr " -> ", showNode node ]
           tuples =  [ (addr, hLookup heap addr) | addr <- hAddresses heap ]
+
+showHeapSize :: TiHeap -> Iseq
+showHeapSize heap = iStr "Heap size: " `iAppend` iNum (hSize heap)
 
 showDump :: TiHeap -> TiStack -> TiDump -> Iseq
 showDump heap stack = iInterleave iNewline . map (showStack heap) . getStacks stack
@@ -135,8 +146,10 @@ showNode (NData tag addrs)     = iConcat [ iStr "NData ", iNum tag, iStr " [",
 showNode (NPrim name _)        = iStr ("NPrim " ++ name)
 showNode (NSupercomb name _ _) = iStr ("NSupercomb " ++ name)
 
-showNode (NNum n)       = iStr "NNum "  `iAppend` iNum n
-showNode (NInd a)       = iStr "NInd "  `iAppend` showAddr a
+showNode (NNum n)       = iStr "NNum " `iAppend` iNum n
+showNode (NInd a)       = iStr "NInd " `iAppend` showAddr a
+
+showNode (NMarked n)    = iStr "NMarked " `iAppend` showNode n
 
 showAddr :: Addr -> Iseq
 showAddr addr = iStr (showaddr addr)
@@ -151,8 +164,9 @@ showOutput (_, _, _, _, out, _) = iConcat [ iStr "Output: ",
 
 showStats :: TiState -> Iseq
 showStats (_, _, _, _, _, stats)
-    = iConcat [ iNewline, iNewline, iStr "Total number of steps = ",
-                iNum (tiStatGetSteps stats) ]
+    = iConcat [ iNewline, iNewline,
+                iStr "Steps: ", iNum (tiStatGetSteps stats),
+                iStr ", GC Count: ", iNum (tiStatGetGC stats) ]
 
 eval :: TiState -> [TiState]
 eval state = state : restStates
@@ -189,7 +203,12 @@ allocatePrim heap (name, prim) = (heap', (name, addr))
     where (heap', addr) = hAlloc heap (NPrim name prim)
 
 doAdmin :: TiState -> TiState
-doAdmin state = applyToStats tiStatIncSteps state
+doAdmin state = runGC . applyToStats tiStatIncSteps $ state
+
+runGC :: TiState -> TiState
+runGC state@(_, _, heap, _, _, _)
+    | hSize heap > 100  = applyToStats tiStatIncGC $ gc state
+    | otherwise         = state
 
 -- Debug version
 --doAdmin state = abortIfSteps 100 . wprint $ applyToStats tiStatIncSteps state
@@ -216,6 +235,8 @@ isDataNode _           = False
 step :: TiState -> TiState
 step state = dispatch (hLookup heap (head stack))
     where (stack, _, heap, _, _, _) = state
+
+          dispatch (NMarked _)   = error "Assert: Unexpected NMarked in step"
 
           dispatch n@(NNum _)    = dataStep state n
           dispatch d@(NData _ _) = dataStep state d
@@ -502,3 +523,46 @@ instantiateAndUpdate (EConstr tag arity) updAddr heap _
 instantiateAndUpdate (ECase _ _) _ _ _ = error "Can't instantiate case exprs"
 instantiateAndUpdate (ELam _ _) _ _ _
     = error "Can't instantiate lambda (should be converted to supercombinator)"
+
+gc :: TiState -> TiState
+gc state@(stack, dump, heap, globals, out, stats) = (stack, dump, heap', globals, out, stats)
+    where heap' = scanHeap . foldr (flip markFrom) heap $ findRoots state
+
+findRoots :: TiState -> [Addr]
+findRoots (stack, dump, _, globals, _, _)
+    = findStackRoots stack ++ findDumpRoots dump ++ findGlobalRoots globals
+
+findStackRoots :: TiStack -> [Addr]
+findStackRoots = id
+
+findDumpRoots :: TiDump -> [Addr]
+findDumpRoots _ = [] -- dump is just a stack offsets
+
+findGlobalRoots :: TiGlobals -> [Addr]
+findGlobalRoots = aRange
+
+markFrom :: TiHeap -> Addr -> TiHeap
+markFrom heap addr = mark heap [addr]
+    where mark :: TiHeap -> [Addr] -> TiHeap
+          mark h []     = h
+          mark h (a:as) = case node of
+              (NAp addr1 addr2)  -> mark h' (addr1:addr2:as)
+              (NInd addr1)       -> mark h' (addr1:as)
+              (NData _ addrs)    -> mark h' (addrs ++ as)
+
+              (NMarked _)        -> mark h as
+
+              (NSupercomb _ _ _) -> mark h' as
+              (NNum _)           -> mark h' as
+              (NPrim _ _)        -> mark h' as
+
+              where node = hLookup h a
+                    h'   = hUpdate h a (NMarked node)
+
+
+scanHeap :: TiHeap -> TiHeap
+scanHeap heap = foldr prune heap (hAddresses heap)
+    where prune addr h
+            | (NMarked boxed) <- node = hUpdate h addr boxed
+            | otherwise               = hFree h addr
+            where node = hLookup heap addr

@@ -1,0 +1,2 @@
+loop x = if (x <= 0) 0 (loop (x - 1));
+main = loop 30
