@@ -28,16 +28,17 @@ data Node = NAp Addr Addr                    -- Application
           | NData Int [Addr]                 -- Tag, list of components
           | NMarked Node                     -- Marked node
 
-data ShowStateOptions = ShowStateOptions { ssHeap :: Bool
-                                         , ssEnv  :: Bool
-                                         , ssDump :: Bool
+data ShowStateOptions = ShowStateOptions { ssHeap     :: Bool
+                                         , ssEnv      :: Bool
+                                         , ssDump     :: Bool
+                                         , ssLastOnly :: Bool
                                          }
 
 dbgOpts :: ShowStateOptions
-dbgOpts = ShowStateOptions True True True
+dbgOpts = ShowStateOptions True True True False
 
 compactOpts :: ShowStateOptions
-compactOpts = ShowStateOptions False False False
+compactOpts = ShowStateOptions False False False True
 
 primitives :: ASSOC Name Primitive
 
@@ -79,10 +80,12 @@ applyToStats statsFun (stack, dump, heap, scDefs, out, stats)
     = (stack, dump, heap, scDefs, out, statsFun stats)
 
 showResults :: ShowStateOptions -> [TiState] -> String
-showResults opts states = iDisplay $ iConcat [ iLayn (map (showState opts) states),
+showResults opts states = iDisplay $ iConcat [ stateOutp,
                                                showOutput lastState,
                                                showStats lastState ]
     where lastState = last states
+          stateOutp | ssLastOnly opts = showState dbgOpts lastState `iAppend` iNewline
+                    | otherwise       = iLayn (map (showState opts) states)
 
 showState :: ShowStateOptions -> TiState -> Iseq
 showState opts (stack, dump, heap, env, _, _)
@@ -525,40 +528,41 @@ instantiateAndUpdate (ELam _ _) _ _ _
     = error "Can't instantiate lambda (should be converted to supercombinator)"
 
 gc :: TiState -> TiState
-gc state@(stack, dump, heap, globals, out, stats) = (stack, dump, heap', globals, out, stats)
-    where heap' = scanHeap . foldr (flip markFrom) heap $ findRoots state
+gc (stack, dump, heap, globals, out, stats) = (stack', dump, heap''', globals', out, stats)
+    where (heap', stack')    = markStackRoots heap stack
+          (heap'', globals') = markGlobalRoots heap' globals
+          heap'''            = scanHeap heap''
 
-findRoots :: TiState -> [Addr]
-findRoots (stack, dump, _, globals, _, _)
-    = findStackRoots stack ++ findDumpRoots dump ++ findGlobalRoots globals
+markStackRoots :: TiHeap -> TiStack -> (TiHeap, TiStack)
+markStackRoots = mapAccuml markFrom
 
-findStackRoots :: TiStack -> [Addr]
-findStackRoots = id
+markGlobalRoots :: TiHeap -> TiGlobals -> (TiHeap, TiGlobals)
+markGlobalRoots = mapAccuml mapf
+    where mapf heap (name, addr) = let (heap', addr') = markFrom heap addr
+                                    in (heap', (name, addr'))
 
-findDumpRoots :: TiDump -> [Addr]
-findDumpRoots _ = [] -- dump is just a stack offsets
+markFrom :: TiHeap -> Addr -> (TiHeap, Addr)
+markFrom heap addr = case node of
+        (NAp addr1 addr2)  -> let (heap2, addr1') = markFrom heap  addr1
+                                  (heap3, addr2') = markFrom heap2 addr2
+                                  heap4 = hUpdate heap3 addr (NMarked $ NAp addr1' addr2')
 
-findGlobalRoots :: TiGlobals -> [Addr]
-findGlobalRoots = aRange
+                               in (heap4, addr)
 
-markFrom :: TiHeap -> Addr -> TiHeap
-markFrom heap addr = mark heap [addr]
-    where mark :: TiHeap -> [Addr] -> TiHeap
-          mark h []     = h
-          mark h (a:as) = case node of
-              (NAp addr1 addr2)  -> mark h' (addr1:addr2:as)
-              (NInd addr1)       -> mark h' (addr1:as)
-              (NData _ addrs)    -> mark h' (addrs ++ as)
+        (NData tag addrs)  -> let (heap2, addrs') = markStackRoots heap addrs
+                                  heap3 = hUpdate heap2 addr (NMarked $ NData tag addrs')
 
-              (NMarked _)        -> mark h as
+                               in (heap3, addr)
 
-              (NSupercomb _ _ _) -> mark h' as
-              (NNum _)           -> mark h' as
-              (NPrim _ _)        -> mark h' as
+        (NMarked _)        -> (heap, addr)
+        (NInd addr1)       -> markFrom heap addr1
 
-              where node = hLookup h a
-                    h'   = hUpdate h a (NMarked node)
+        (NSupercomb _ _ _) -> (heap', addr)
+        (NNum _)           -> (heap', addr)
+        (NPrim _ _)        -> (heap', addr)
 
+    where node  = hLookup heap addr
+          heap' = hUpdate heap addr (NMarked node)
 
 scanHeap :: TiHeap -> TiHeap
 scanHeap heap = foldr prune heap (hAddresses heap)
