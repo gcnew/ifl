@@ -1,0 +1,3 @@
+loop x = let c = head x
+          in if (c <= 0) 0 (loop (Cons (c - 1) Nil));
+main = loop (Cons 12 Nil)

@@ -26,7 +26,10 @@ data Node = NAp Addr Addr                    -- Application
           | NInd Addr                        -- Indirection
           | NPrim Name Primitive             -- Primitive
           | NData Int [Addr]                 -- Tag, list of components
-          | NMarked Node                     -- Marked node
+          | NMarked MarkState Node           -- Marked node
+
+data MarkState = Done       -- Mark node as finised
+               | Visit Int  -- Node visited n times so far
 
 data ShowStateOptions = ShowStateOptions { ssHeap     :: Bool
                                          , ssEnv      :: Bool
@@ -152,7 +155,8 @@ showNode (NSupercomb name _ _) = iStr ("NSupercomb " ++ name)
 showNode (NNum n)       = iStr "NNum " `iAppend` iNum n
 showNode (NInd a)       = iStr "NInd " `iAppend` showAddr a
 
-showNode (NMarked n)    = iStr "NMarked " `iAppend` showNode n
+showNode (NMarked Done n)      = iStr "NMarked Done " `iAppend` showNode n
+showNode (NMarked (Visit x) n) = iConcat [ iStr "NMarked (Visit ", iNum x, iStr ") ", showNode n ]
 
 showAddr :: Addr -> Iseq
 showAddr addr = iStr (showaddr addr)
@@ -239,7 +243,7 @@ step :: TiState -> TiState
 step state = dispatch (hLookup heap (head stack))
     where (stack, _, heap, _, _, _) = state
 
-          dispatch (NMarked _)   = error "Assert: Unexpected NMarked in step"
+          dispatch (NMarked _ _) = error "Assert: Unexpected NMarked in step"
 
           dispatch n@(NNum _)    = dataStep state n
           dispatch d@(NData _ _) = dataStep state d
@@ -542,31 +546,60 @@ markGlobalRoots = mapAccuml mapf
                                     in (heap', (name, addr'))
 
 markFrom :: TiHeap -> Addr -> (TiHeap, Addr)
-markFrom heap addr = case node of
-        (NAp addr1 addr2)  -> let (heap2, addr1') = markFrom heap' addr1
-                                  (heap3, addr2') = markFrom heap2 addr2
-                                  heap4 = hUpdate heap3 addr (NMarked $ NAp addr1' addr2')
+markFrom heap addr = markNode addr hNull heap
 
-                               in (heap4, addr)
+markNode :: Addr -> Addr -> TiHeap -> (TiHeap, Addr)
+markNode addr back heap
+    | hIsNull addr = (heap, back)
+    | otherwise    = case node of
+        (NMarked Done _) -> markNode back addr heap
+        (NMarked (Visit n) marked) -> visit n marked
 
-        (NData tag addrs)  -> let (heap2, addrs') = markStackRoots heap' addrs
-                                  heap3 = hUpdate heap2 addr (NMarked $ NData tag addrs')
+        (NInd addr1) -> markNode addr1 back heap
 
-                               in (heap3, addr)
+        -- make Visit nodes
+        (NAp _ _)       -> markNode addr back heapVisit
+        (NData _ addrs) | length addrs == 0 -> markNode addr back heapDone  -- treat as if atom
+                        | otherwise         -> markNode addr back heapVisit
 
-        (NMarked _)        -> (heap, addr)
-        (NInd addr1)       -> markFrom heap addr1
+        -- make Done nodes
+        (NSupercomb _ _ _) -> markNode back addr heapDone
+        (NNum _)           -> markNode back addr heapDone
+        (NPrim _ _)        -> markNode back addr heapDone
 
-        (NSupercomb _ _ _) -> (heap', addr)
-        (NNum _)           -> (heap', addr)
-        (NPrim _ _)        -> (heap', addr)
+    where node = hLookup heap addr
+          heapDone  = hUpdate heap addr (NMarked Done node)
+          heapVisit = hUpdate heap addr (NMarked (Visit 0) node)
 
-    where node  = hLookup heap addr
-          heap' = hUpdate heap addr (NMarked node)
+          markUpdate fwd = markNode fwd addr . hUpdate heap addr
+
+          visit n (NAp addr1 addr2)
+            | n == 0 = markUpdate addr1 $ next (NAp back addr2)
+            | n == 1 = markUpdate addr2 $ next (NAp back addr1)
+            | n == 2 = markUpdate addr2 $ done (NAp addr1 back)
+            | otherwise = error "Assert: unexpected visit count for NAp"
+
+            where next = NMarked (Visit $ n + 1)
+                  done = NMarked Done
+
+          visit n (NData tag addrs)
+            | n == 0            = markUpdate (addrs !! n) $ next [(0, back)]
+            | n  < length addrs = markUpdate (addrs !! n) $ next [(n - 1, back), (n, addrs !! n - 1)]
+            | n == length addrs = markUpdate (last addrs) $ done [(n - 1, back)]
+            | otherwise = error "Assert: unexpected visit count for NData"
+
+            where next = NMarked (Visit $ n + 1) . NData tag . replaceAll addrs
+                  done = NMarked Done . NData tag . replaceAll addrs
+
+          visit _ (NInd _)           = error "Assert: unexpected NInd node"
+          visit _ (NMarked _ _)      = error "Assert: unexpected NMarked node"
+          visit _ (NSupercomb _ _ _) = error "Assert: unexpected NSupercomb node"
+          visit _ (NNum _)           = error "Assert: unexpected NNum node"
+          visit _ (NPrim _ _)        = error "Assert: unexpected NPrim node"
 
 scanHeap :: TiHeap -> TiHeap
 scanHeap heap = foldr prune heap (hAddresses heap)
     where prune addr h
-            | (NMarked boxed) <- node = hUpdate h addr boxed
-            | otherwise               = hFree h addr
+            | (NMarked _ boxed) <- node = hUpdate h addr boxed
+            | otherwise                 = hFree h addr
             where node = hLookup heap addr

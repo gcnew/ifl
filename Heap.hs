@@ -32,8 +32,8 @@ hSize (size, _, _) = size
 hNull :: Addr
 hNull = 0
 
-hIsnull :: Addr -> Bool
-hIsnull = (== hNull)
+hIsNull :: Addr -> Bool
+hIsNull = (== hNull)
 
 showaddr :: Addr -> [Char]
 showaddr a = '#' : show a
