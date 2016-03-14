@@ -1,0 +1,31 @@
+if = I;
+
+True  t f = t;
+False t f = f;
+
+MkPair l r f = f l r;
+fst p = p K;
+snd p = p K1;
+
+loop x = if (x <= 0) 0 (loop (x - 1));
+
+-- cons h t cn cc = cc h t;
+-- nil cn cc = cn;
+-- hd l = l abort K;
+-- tl l = l abort K1;
+--
+-- obj = letrec x = cons 1 y;
+--              y = cons 2 z;
+--              z = cons 3 x
+--           in x;
+--
+-- sum o = hd o + hd (tl o) + hd (tl (tl o));
+
+obj = letrec x = MkPair y 1;
+             y = MkPair z 2;
+             z = MkPair x 3
+          in x;
+
+sum o = snd o + snd (fst o) + snd (fst (fst o));
+
+main = sum obj + loop 10 + sum obj
