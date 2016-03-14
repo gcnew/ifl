@@ -543,13 +543,13 @@ markGlobalRoots = mapAccuml mapf
 
 markFrom :: TiHeap -> Addr -> (TiHeap, Addr)
 markFrom heap addr = case node of
-        (NAp addr1 addr2)  -> let (heap2, addr1') = markFrom heap  addr1
+        (NAp addr1 addr2)  -> let (heap2, addr1') = markFrom heap' addr1
                                   (heap3, addr2') = markFrom heap2 addr2
                                   heap4 = hUpdate heap3 addr (NMarked $ NAp addr1' addr2')
 
                                in (heap4, addr)
 
-        (NData tag addrs)  -> let (heap2, addrs') = markStackRoots heap addrs
+        (NData tag addrs)  -> let (heap2, addrs') = markStackRoots heap' addrs
                                   heap3 = hUpdate heap2 addr (NMarked $ NData tag addrs')
 
                                in (heap3, addr)
