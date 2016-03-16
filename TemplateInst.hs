@@ -549,53 +549,42 @@ markFrom :: TiHeap -> Addr -> (TiHeap, Addr)
 markFrom heap addr = markNode addr hNull heap
 
 markNode :: Addr -> Addr -> TiHeap -> (TiHeap, Addr)
-markNode addr back heap
-    | hIsNull addr = (heap, back)
-    | otherwise    = case node of
-        (NMarked Done _) -> markNode back addr heap
-        (NMarked (Visit n) marked) -> visit n marked
+markNode addr back heap = case node of
+        (NMarked Done _)
+            | hIsNull back
+                -> (heap, addr)
 
+        (NMarked _ _)
+            | (NMarked (Visit 1) (NAp b' addr2)) <- hLookup heap back
+                -> markNode addr2 back $ hUpdate heap back (NMarked (Visit 2) (NAp addr b'))
+
+            | (NMarked (Visit 2) (NAp addr1 b')) <- hLookup heap back
+                -> markNode back b' $ hUpdate heap back (NMarked Done (NAp addr1 addr))
+
+            | (NMarked (Visit n) (NData tag addrs)) <- hLookup heap back, n < length addrs
+                -> markNode (addrs !! n) back $ hUpdate heap back (NMarked (Visit $ n + 1) (NData tag $ replaceAll addrs [(n - 1, addr), (n, addrs !! (n - 1))]))
+
+            | (NMarked (Visit n) (NData tag addrs)) <- hLookup heap back, n == length addrs
+                -> markNode back (last addrs) $ hUpdate heap back (NMarked Done (NData tag $ replace addrs (n - 1, addr)))
+
+            | otherwise -> error $ "GC: unexpected node type: " ++ (iDisplay . showNode $ hLookup heap back)
+
+        (NAp addr1 addr2)  -> markNode addr1 addr $ hUpdate heap addr (NMarked (Visit 1) (NAp back addr2))
+
+        (NData tag addrs)
+            | null addrs   -> markNode addr back heapDone -- treat as if atom
+            | otherwise    -> markNode (head addrs) addr $ hUpdate heap addr (NMarked (Visit 1) (NData tag $ replace addrs (0, back)))
+
+        -- indirections
         (NInd addr1) -> markNode addr1 back heap
 
-        -- make Visit nodes
-        (NAp _ _)       -> markNode addr back heapVisit
-        (NData _ addrs) | length addrs == 0 -> markNode addr back heapDone  -- treat as if atom
-                        | otherwise         -> markNode addr back heapVisit
-
         -- make Done nodes
-        (NSupercomb _ _ _) -> markNode back addr heapDone
-        (NNum _)           -> markNode back addr heapDone
-        (NPrim _ _)        -> markNode back addr heapDone
+        (NSupercomb _ _ _) -> markNode addr back heapDone
+        (NNum _)           -> markNode addr back heapDone
+        (NPrim _ _)        -> markNode addr back heapDone
 
     where node = hLookup heap addr
           heapDone  = hUpdate heap addr (NMarked Done node)
-          heapVisit = hUpdate heap addr (NMarked (Visit 0) node)
-
-          markUpdate fwd = markNode fwd addr . hUpdate heap addr
-
-          visit n (NAp addr1 addr2)
-            | n == 0 = markUpdate addr1 $ next (NAp back addr2)
-            | n == 1 = markUpdate addr2 $ next (NAp back addr1)
-            | n == 2 = markUpdate addr2 $ done (NAp addr1 back)
-            | otherwise = error "Assert: unexpected visit count for NAp"
-
-            where next = NMarked (Visit $ n + 1)
-                  done = NMarked Done
-
-          visit n (NData tag addrs)
-            | n == 0            = markUpdate (addrs !! n) $ next [(0, back)]
-            | n  < length addrs = markUpdate (addrs !! n) $ next [(n - 1, back), (n, addrs !! n - 1)]
-            | n == length addrs = markUpdate (last addrs) $ done [(n - 1, back)]
-            | otherwise = error "Assert: unexpected visit count for NData"
-
-            where next = NMarked (Visit $ n + 1) . NData tag . replaceAll addrs
-                  done = NMarked Done . NData tag . replaceAll addrs
-
-          visit _ (NInd _)           = error "Assert: unexpected NInd node"
-          visit _ (NMarked _ _)      = error "Assert: unexpected NMarked node"
-          visit _ (NSupercomb _ _ _) = error "Assert: unexpected NSupercomb node"
-          visit _ (NNum _)           = error "Assert: unexpected NNum node"
-          visit _ (NPrim _ _)        = error "Assert: unexpected NPrim node"
 
 scanHeap :: TiHeap -> TiHeap
 scanHeap heap = foldr prune heap (hAddresses heap)
