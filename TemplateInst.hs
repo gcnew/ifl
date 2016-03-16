@@ -322,7 +322,7 @@ primAbort _ = error "Core: abort"
 
 primDyadic :: TiState -> (Node -> Node -> Node) -> TiState
 primDyadic (stack, dump, heap, globals, out, stats) op
-    | length args == 2     = error "Primitive Dyadic: invalid arguments count"
+    | length args < 2      = error "Primitive Dyadic: invalid arguments count"
 
     | not (isDataNode nA1) = let (stack', dump') = newStack stack dump 1 [aA1]
                               in (stack', dump', heap, globals, out, stats)
