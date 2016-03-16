@@ -546,45 +546,53 @@ markGlobalRoots = mapAccuml mapf
                                     in (heap', (name, addr'))
 
 markFrom :: TiHeap -> Addr -> (TiHeap, Addr)
-markFrom heap addr = markNode addr hNull heap
+markFrom heap addr = markLoop addr hNull heap
 
-markNode :: Addr -> Addr -> TiHeap -> (TiHeap, Addr)
-markNode addr back heap = case node of
+markLoop :: Addr -> Addr -> TiHeap -> (TiHeap, Addr)
+markLoop addr back heap = case node of
         (NMarked Done _)
             | hIsNull back
                 -> (heap, addr)
 
-        (NMarked _ _)
-            | (NMarked (Visit 1) (NAp b' addr2)) <- hLookup heap back
-                -> markNode addr2 back $ hUpdate heap back (NMarked (Visit 2) (NAp addr b'))
+        (NMarked _ _) -> case backNode of
+            (NMarked (Visit 1) (NAp b' addr2))
+                -> markBack addr2 back $ NMarked (Visit 2) (NAp addr b')
 
-            | (NMarked (Visit 2) (NAp addr1 b')) <- hLookup heap back
-                -> markNode back b' $ hUpdate heap back (NMarked Done (NAp addr1 addr))
+            (NMarked (Visit 2) (NAp addr1 b'))
+                -> markBack back b' $ NMarked Done (NAp addr1 addr)
 
-            | (NMarked (Visit n) (NData tag addrs)) <- hLookup heap back, n < length addrs
-                -> markNode (addrs !! n) back $ hUpdate heap back (NMarked (Visit $ n + 1) (NData tag $ replaceAll addrs [(n - 1, addr), (n, addrs !! (n - 1))]))
+            (NMarked (Visit n) (NData tag addrs))
+                | n < length addrs
+                    -> let addrs' = replaceAll addrs [(n - 1, addr), (n, addrs !! (n - 1))]
+                        in markBack (addrs !! n) back $ NMarked (Visit $ n + 1) (NData tag addrs')
 
-            | (NMarked (Visit n) (NData tag addrs)) <- hLookup heap back, n == length addrs
-                -> markNode back (last addrs) $ hUpdate heap back (NMarked Done (NData tag $ replace addrs (n - 1, addr)))
+                | otherwise
+                    -> let addrs' = replace addrs (n - 1, addr)
+                        in markBack back (last addrs) $ NMarked Done (NData tag addrs')
 
-            | otherwise -> error $ "GC: unexpected node type: " ++ (iDisplay $ showNode node)
+            _   -> error $ "GC: unexpected node type: " ++ (iDisplay $ showNode node)
 
-        (NAp addr1 addr2)  -> markNode addr1 addr $ hUpdate heap addr (NMarked (Visit 1) (NAp back addr2))
+        (NAp addr1 addr2) -> markFwd addr1 addr $ NMarked (Visit 1) (NAp back addr2)
 
         (NData tag addrs)
-            | null addrs   -> markNode addr back heapDone -- treat as if atom
-            | otherwise    -> markNode (head addrs) addr $ hUpdate heap addr (NMarked (Visit 1) (NData tag $ replace addrs (0, back)))
+            | null addrs -> markFwd addr back $ NMarked Done node -- treat as if atom
+
+            | otherwise  -> let addrs' = replace addrs (0, back)
+                             in markFwd (head addrs) addr $ NMarked (Visit 1) (NData tag addrs')
 
         -- indirections
-        (NInd addr1) -> markNode addr1 back heap
+        (NInd addr1) -> markLoop addr1 back heap
 
         -- make Done nodes
-        (NSupercomb _ _ _) -> markNode addr back heapDone
-        (NNum _)           -> markNode addr back heapDone
-        (NPrim _ _)        -> markNode addr back heapDone
+        (NSupercomb _ _ _) -> markFwd addr back $ NMarked Done node
+        (NNum _)           -> markFwd addr back $ NMarked Done node
+        (NPrim _ _)        -> markFwd addr back $ NMarked Done node
 
-    where node = hLookup heap addr
-          heapDone  = hUpdate heap addr (NMarked Done node)
+    where node     = hLookup heap addr
+          backNode = hLookup heap back
+
+          markBack fwd bwd = markLoop fwd bwd . hUpdate heap back
+          markFwd  fwd bwd = markLoop fwd bwd . hUpdate heap addr
 
 scanHeap :: TiHeap -> TiHeap
 scanHeap heap = foldr prune heap (hAddresses heap)
