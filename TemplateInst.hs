@@ -27,6 +27,7 @@ data Node = NAp Addr Addr                    -- Application
           | NPrim Name Primitive             -- Primitive
           | NData Int [Addr]                 -- Tag, list of components
           | NMarked MarkState Node           -- Marked node
+          | NForward Addr                    -- Forwarding node (two-space gc)
 
 data MarkState = Done       -- Mark node as finised
                | Visit Int  -- Node visited n times so far
@@ -155,6 +156,8 @@ showNode (NSupercomb name _ _) = iStr ("NSupercomb " ++ name)
 showNode (NNum n)       = iStr "NNum " `iAppend` iNum n
 showNode (NInd a)       = iStr "NInd " `iAppend` showAddr a
 
+showNode (NForward a)   = iStr "NForward " `iAppend` showAddr a
+
 showNode (NMarked Done n)      = iStr "NMarked Done " `iAppend` showNode n
 showNode (NMarked (Visit x) n) = iConcat [ iStr "NMarked (Visit ", iNum x, iStr ") ", showNode n ]
 
@@ -244,6 +247,7 @@ step state = dispatch (hLookup heap (head stack))
     where (stack, _, heap, _, _, _) = state
 
           dispatch (NMarked _ _) = error "Assert: Unexpected NMarked in step"
+          dispatch (NForward _)  = error "Assert: Unexpected NForward in step"
 
           dispatch n@(NNum _)    = dataStep state n
           dispatch d@(NData _ _) = dataStep state d
@@ -541,9 +545,11 @@ markStackRoots :: TiHeap -> TiStack -> (TiHeap, TiStack)
 markStackRoots = mapAccuml markFrom
 
 markGlobalRoots :: TiHeap -> TiGlobals -> (TiHeap, TiGlobals)
-markGlobalRoots = mapAccuml mapf
-    where mapf heap (name, addr) = let (heap', addr') = markFrom heap addr
-                                    in (heap', (name, addr'))
+markGlobalRoots = mapAccuml (mapGlobals markFrom)
+
+mapGlobals :: (a -> Addr -> (a, Addr)) -> a -> (Name, Addr) -> (a, (Name, Addr))
+mapGlobals f heap (name, addr) = let (heap', addr') = f heap addr
+                                  in (heap', (name, addr'))
 
 markFrom :: TiHeap -> Addr -> (TiHeap, Addr)
 markFrom heap addr = markLoop addr hNull heap
@@ -588,6 +594,8 @@ markLoop addr back heap = case node of
         (NNum _)           -> markFwd addr back $ NMarked Done node
         (NPrim _ _)        -> markFwd addr back $ NMarked Done node
 
+        (NForward _) -> error "Assert: Unexpected NForward node during GC"
+
     where node     = hLookup heap addr
           backNode = hLookup heap back
 
@@ -600,3 +608,57 @@ scanHeap heap = foldr prune heap (hAddresses heap)
             | (NMarked _ boxed) <- node = hUpdate h addr boxed
             | otherwise                 = hFree h addr
             where node = hLookup heap addr
+
+moveFrom :: (Addr -> Bool -> a)         -- wrapper to distinguish between
+                                        -- forwarded/moved node if needed
+              -> (TiHeap, TiHeap)       -- tuple of the (from, to) heaps
+              -> Addr                   -- address of from node (to be moved)
+              -> ((TiHeap, TiHeap), a)  -- resulting heaps and moved (to) address
+
+moveFrom wrapper (from, to) addr = case node of
+        (NForward fwd) -> ((from, to), wrapper fwd False)
+
+        (NInd addr1)   -> moveFrom wrapper (from, to) addr1
+
+        _              -> let (to', fwd) = hAlloc to node
+                              from'      = hUpdate from addr (NForward fwd)
+                           in ((from', to'), wrapper fwd True)
+
+    where node = hLookup from addr
+
+evacuateStack :: (TiHeap, TiHeap) -> TiStack -> ((TiHeap, TiHeap), TiStack)
+evacuateStack = mapAccuml (moveFrom const)
+
+evacuateGlobals :: (TiHeap, TiHeap) -> TiGlobals -> ((TiHeap, TiHeap), TiGlobals)
+evacuateGlobals = mapAccuml (mapGlobals (moveFrom const))
+
+scavengeHeap :: (TiHeap, TiHeap) -> TiHeap
+scavengeHeap (from, to) = scavengeLoop (from, to) (hAddresses to)
+
+scavengeLoop :: (TiHeap, TiHeap) -> [Addr] -> TiHeap
+scavengeLoop (_, to) [] = to
+scavengeLoop (from, to) (addr:rest) = case node of
+
+        (NAp addr1 addr2) -> let (hs,  wAddr1)          = wrapMove (from, to) addr1
+                                 ((from', to'), wAddr2) = wrapMove hs addr2
+                                 to'' = hUpdate to' addr $ NAp (fst wAddr1) (fst wAddr2)
+                                 moved = filterMoved [wAddr1, wAddr2]
+                              in scavengeLoop (from', to'') (moved ++ rest)
+
+        (NData tag addrs) -> let ((from', to'), wAddrs) = mapAccuml wrapMove (from, to) addrs
+                                 to'' = hUpdate to' addr $ NData tag (map fst wAddrs)
+                                 moved = filterMoved wAddrs
+                              in scavengeLoop (from', to'') (moved ++ rest)
+
+        -- atoms
+        (NSupercomb _ _ _) -> scavengeLoop (from, to) rest
+        (NNum _)           -> scavengeLoop (from, to) rest
+        (NPrim _ _)        -> scavengeLoop (from, to) rest
+
+        (NInd _)      -> error "Assert: Unexpected NInd node during scavenge"
+        (NForward _)  -> error "Assert: Unexpected NForward node during scavenge"
+        (NMarked _ _) -> error "Assert: Unexpected NMarked node during scavenge"
+
+    where node        = hLookup to addr
+          wrapMove    = moveFrom (,)
+          filterMoved = map fst . filter snd
