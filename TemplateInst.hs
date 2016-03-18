@@ -38,6 +38,12 @@ data ShowStateOptions = ShowStateOptions { ssHeap     :: Bool
                                          , ssLastOnly :: Bool
                                          }
 
+data GC a = GC { wrap        :: TiHeap -> a
+               , markStack   :: a -> TiStack   -> (a, TiStack)
+               , markGlobals :: a -> TiGlobals -> (a, TiGlobals)
+               , sweep       :: a -> TiHeap
+               }
+
 dbgOpts :: ShowStateOptions
 dbgOpts = ShowStateOptions True True True False
 
@@ -178,17 +184,17 @@ showStats (_, _, _, _, _, stats)
                 iStr "Steps: ", iNum (tiStatGetSteps stats),
                 iStr ", GC Count: ", iNum (tiStatGetGC stats) ]
 
-eval :: TiState -> [TiState]
-eval state = state : restStates
+eval :: GC a -> TiState -> [TiState]
+eval gci state = state : restStates
     where restStates | tiFinal state = []
-                     | otherwise     = eval nextState
-          nextState = doAdmin (step state)
+                     | otherwise     = eval gci nextState
+          nextState = doAdmin gci (step state)
 
-runProg :: String -> String
-runProg = showResults compactOpts . eval . compile . parse
+runProg :: GC a -> String -> String
+runProg gci = showResults compactOpts . eval gci . compile . parse
 
-runDebugProg :: String -> String
-runDebugProg = showResults dbgOpts . eval . compile . parse
+runDebugProg :: GC a -> String -> String
+runDebugProg gci = showResults dbgOpts . eval gci . compile . parse
 
 compile :: CoreProgram -> TiState
 compile program = (initialStack, initialTiDump, initialHeap, globals, [], tiStatInitial)
@@ -212,12 +218,12 @@ allocatePrim :: TiHeap -> (Name, Primitive) -> (TiHeap, (Name, Addr))
 allocatePrim heap (name, prim) = (heap', (name, addr))
     where (heap', addr) = hAlloc heap (NPrim name prim)
 
-doAdmin :: TiState -> TiState
-doAdmin state = runGC . applyToStats tiStatIncSteps $ state
+doAdmin :: GC a -> TiState -> TiState
+doAdmin gci state = runGC gci . applyToStats tiStatIncSteps $ state
 
-runGC :: TiState -> TiState
-runGC state@(_, _, heap, _, _, _)
-    | hSize heap > 100  = applyToStats tiStatIncGC $ gc state
+runGC :: GC a -> TiState -> TiState
+runGC gci state@(_, _, heap, _, _, _)
+    | hSize heap > 100  = applyToStats tiStatIncGC $ gc gci state
     | otherwise         = state
 
 -- Debug version
@@ -535,11 +541,11 @@ instantiateAndUpdate (ECase _ _) _ _ _ = error "Can't instantiate case exprs"
 instantiateAndUpdate (ELam _ _) _ _ _
     = error "Can't instantiate lambda (should be converted to supercombinator)"
 
-gc :: TiState -> TiState
-gc (stack, dump, heap, globals, out, stats) = (stack', dump, heap''', globals', out, stats)
-    where (heap', stack')    = markStackRoots heap stack
-          (heap'', globals') = markGlobalRoots heap' globals
-          heap'''            = scanHeap heap''
+gc :: GC a -> TiState -> TiState
+gc gci (stack, dump, heap, globals, out, stats) = (stack', dump, heap''', globals', out, stats)
+    where (heap', stack')    = markStack gci (wrap gci heap) stack
+          (heap'', globals') = markGlobals gci heap' globals
+          heap'''            = sweep gci heap''
 
 markStackRoots :: TiHeap -> TiStack -> (TiHeap, TiStack)
 markStackRoots = mapAccuml markFrom
@@ -662,3 +668,17 @@ scavengeLoop (from, to) (addr:rest) = case node of
     where node        = hLookup to addr
           wrapMove    = moveFrom (,)
           filterMoved = map fst . filter snd
+
+gcMarkAndSweep :: GC TiHeap
+gcMarkAndSweep = GC { wrap        = id
+                    , markStack   = markStackRoots
+                    , markGlobals = markGlobalRoots
+                    , sweep       = scanHeap
+                    }
+
+gcTwoSpace :: GC (TiHeap, TiHeap)
+gcTwoSpace = GC { wrap        = flip (,) hInitial
+                , markStack   = evacuateStack
+                , markGlobals = evacuateGlobals
+                , sweep       = scavengeHeap
+                }
