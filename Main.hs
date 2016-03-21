@@ -45,5 +45,32 @@ extraPreludeDefs = parseDefs [
         "not x = if x False True"
     ]
 
+lambdaPreludeDefs :: CoreProgram
+lambdaPreludeDefs = parseDefs [
+        "caseList = I",
+        "casePair = I",
+        "if = I",
+
+        "MkPair a b f = f a b",
+        "fst p = p K",
+        "snd p = p K1",
+
+        "Nil cn cc=cn",
+        "Cons a b cn cc = cc a b",
+        "head l = caseList l abort K",
+        "tail l = caseList l abort K1",
+
+        "Unit = negate 1",
+        "printList xs = caseList xs Unit printCons",
+        "printCons h t = print h (printList t)",
+
+        "True t f = t",
+        "False t f = f",
+
+        "and b1 b2 t f = b1 (b2 t f) f",
+        "or b1 b2 t f = b1 t (b2 t f)",
+        "not b t f = b f t"
+    ]
+
 main :: IO ()
 main = putStrLn . pprint $ preludeDefs ++ extraPreludeDefs

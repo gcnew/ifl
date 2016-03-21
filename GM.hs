@@ -7,7 +7,7 @@ import Heap
 import Iseq
 import Utils
 import Parser (parse)
-import Main (preludeDefs)
+import Main (preludeDefs, lambdaPreludeDefs)
 
 type GmStats = Int
 type GmStack = [Addr]
@@ -112,7 +112,7 @@ unwind state = newState (hLookup (gmHeap state) addr)
 
 compile :: CoreProgram -> GmState
 compile program = GmState initialCode [] heap globals statInitial
-    where scDefs = program ++ preludeDefs
+    where scDefs = program ++ preludeDefs ++ lambdaPreludeDefs
           (heap, globals) = buildInitialHeap scDefs
 
 initialCode :: GmCode
