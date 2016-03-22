@@ -14,6 +14,10 @@ data Iseq = INil
 iNil :: Iseq                     -- The empty iseq
 iNil = INil
 
+iIsNil :: Iseq -> Bool
+iIsNil INil = True
+iIsNil _    = False
+
 iStr :: String -> Iseq           -- Turn a string into an iseq
 iStr = iInterleave iNewline . map mkIStr . split '\n'
     where mkIStr ""  = iNil

@@ -113,10 +113,7 @@ showState opts (stack, dump, heap, env, _, _)
 
           extra | null views = iNil
                 | otherwise  = iSplitView views `iAppend` iNewline
-                where views = filter (not . isNil) [ heapLines, envLines, dumpLines ]
-
-                      isNil INil = True
-                      isNil _    = False
+                where views = filter (not . iIsNil) [ heapLines, envLines, dumpLines ]
 
 showHeap :: TiHeap -> Iseq
 showHeap heap = iInterleave iNewline (map formatter tuples)

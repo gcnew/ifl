@@ -38,6 +38,17 @@ data GmState = GmState { gmCode    :: GmCode,     -- Current instruction stream
                          gmStats   :: GmStats     -- Statistics
                        }
 
+data ShowStateOptions = ShowStateOptions { ssHeap     :: Bool
+                                         , ssEnv      :: Bool
+                                         , ssDump     :: Bool
+                                         , ssLastOnly :: Bool
+                                         }
+
+dbgOpts :: ShowStateOptions
+dbgOpts = ShowStateOptions True True True False
+
+compactOpts :: ShowStateOptions
+compactOpts = ShowStateOptions False False False True
 
 statInitial :: GmStats
 statInitial = 0
@@ -49,7 +60,10 @@ statGetSteps :: GmStats -> Int
 statGetSteps s = s
 
 runProg :: String -> String
-runProg = showResults . eval . compile . parse
+runProg = showResults compactOpts . eval . compile . parse
+
+runDebugProg :: String -> String
+runDebugProg = showResults dbgOpts . eval . compile . parse
 
 eval :: GmState -> [GmState]
 eval state = state : restStates
@@ -69,7 +83,7 @@ step state = dispatch i (state { gmCode = is })
     where (i:is) = gmCode state
 
           dispatch (PushGlobal f) = pushGlobal f
-          dispatch (PushInt n)    = pushInt n
+          dispatch (PushInt n)    = pushIntMemo n
 
           dispatch (Push n)  = push n
           dispatch (Slide n) = slide n
@@ -84,6 +98,21 @@ pushGlobal name state = state { gmStack = addr : (gmStack state) }
 pushInt :: Int -> GmState -> GmState
 pushInt n state = state { gmStack = addr : (gmStack state), gmHeap = heap' }
     where (heap', addr) = hAlloc (gmHeap state) (NNum n)
+
+pushIntMemo :: Int -> GmState -> GmState
+pushIntMemo n state = state {
+                        gmStack = addr : (gmStack state),
+                        gmHeap = heap',
+                        gmGlobals = globals'
+                      }
+    where heap    = gmHeap state
+          globals = gmGlobals state
+          found   = aLookup globals (show n) hNull
+
+          (globals', (heap', addr))
+              | hIsNull found = ((show n, addr) : globals, hAlloc heap (NNum n))
+              | otherwise     = (globals, (heap, found))
+
 
 mkAp :: GmState -> GmState
 mkAp state = state { gmStack = addr : rest, gmHeap = heap' }
@@ -153,18 +182,22 @@ compileC (ELam _ _) _    = error "ELam: not yet implemented"
 compiledPrimitives :: [GmCompiledSC]
 compiledPrimitives = []
 
-showResults :: [GmState] -> [Char]
-showResults states = iDisplay (iConcat [
+showResults :: ShowStateOptions -> [GmState] -> [Char]
+showResults opts states = iDisplay $ iConcat [
                                 iStr "Supercombinator definitions", iNewline,
                                 iInterleave iNewline (map (showSC s) (gmGlobals s)),
                                 iNewline, iNewline,
                                 iStr "State transitions",
                                 iNewline, iNewline,
-                                iLayn (map showState states),
+                                stateOutp,
                                 iNewline, iNewline,
-                                showStats (last states)
-                            ])
+                                showStats lastState
+                            ]
     where (s:_) = states
+          lastState = last states
+
+          stateOutp | ssLastOnly opts = showState dbgOpts lastState `iAppend` iNewline
+                    | otherwise       = iLayn (map (showState opts) states)
 
 showSC :: GmState -> (Name, Addr) -> Iseq
 showSC s (name, addr) = iConcat [ iStr "Code for ",
@@ -188,9 +221,24 @@ showInstruction (PushGlobal f) = (iStr "PushGlobal ") `iAppend` (iStr f)
 showInstruction (Push n)  = (iStr "Push ")  `iAppend` (iNum n)
 showInstruction (Slide n) = (iStr "Slide ") `iAppend` (iNum n)
 
-showState :: GmState -> Iseq
-showState s = iInterleave iNewline [ showStack s,
-                                     showInstructions (gmCode s) ]
+showState :: ShowStateOptions -> GmState -> Iseq
+showState opts s | null views = iNil
+                 | otherwise  = iSplitView views `iAppend` iNewline
+
+    where stackLines = showStack s
+
+          codeLines  = showInstructions (gmCode s)
+
+          heapLines | ssHeap opts = showHeap s
+                    | otherwise   = iNil
+
+          envLines  | ssEnv opts  = showEnv (gmGlobals s)
+                    | otherwise   = iNil
+
+          views = filter (not . iIsNil) [ heapLines,
+                                          envLines,
+                                          codeLines,
+                                          stackLines ]
 
 showStack :: GmState -> Iseq
 showStack s = iConcat [ iStr " Stack:[",
@@ -213,5 +261,18 @@ showNode s a (NGlobal _ _) = iConcat [ iStr "Global ", iStr v ]
 showNode _ _ (NAp a1 a2) = iConcat [ iStr "Ap ", iStr (showaddr a1),
                                      iStr " ",   iStr (showaddr a2) ]
 
+showHeap :: GmState -> Iseq
+showHeap state = iInterleave iNewline (map formatter tuples)
+    where formatter (addr, node) = iConcat [ iStr (showaddr addr),
+                                             iStr " -> ",
+                                             showNode state addr node ]
+
+          heap   = gmHeap state
+          tuples =  [ (addr, hLookup heap addr) | addr <- hAddresses heap ]
+
+showEnv :: GmGlobals -> Iseq
+showEnv = iInterleave iNewline . map formatter
+    where formatter (name, addr) = iConcat [ iStr name, iStr " -> ", iStr (showaddr addr) ]
+
 showStats :: GmState -> Iseq
-showStats s = iConcat [ iStr "Steps taken = ", iNum (statGetSteps (gmStats s))]
+showStats s = iConcat [ iStr "Steps taken = ", iNum (statGetSteps (gmStats s)) ]
