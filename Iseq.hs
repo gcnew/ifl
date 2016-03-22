@@ -20,9 +20,7 @@ iStr = iInterleave iNewline . map mkIStr . split '\n'
           mkIStr str = IStr str
 
 iAppend :: Iseq -> Iseq -> Iseq  -- Append two iseqs
-iAppend INil s2   = s2
-iAppend s1   INil = s1
-iAppend s1   s2   = IAppend s1 s2
+iAppend = IAppend
 
 iNewline :: Iseq                 -- New line with indentation
 iNewline = INewline
