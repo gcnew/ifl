@@ -31,7 +31,9 @@ data Instruction = Unwind
                  | MkAp
                  | Update Int
                  | Pop Int
-                 deriving (Eq)
+                 | Slide Int
+                 | Alloc Int
+                 deriving (Eq, Show)
 
 data GmState = GmState { gmCode    :: GmCode,     -- Current instruction stream
                          gmStack   :: GmStack,    -- Current stack
@@ -92,6 +94,9 @@ step state = dispatch i (state { gmCode = is })
           dispatch (Push n)   = push n
           dispatch (Update n) = update n
 
+          dispatch (Slide n)  = slide n
+          dispatch (Alloc n)  = alloc n
+
           dispatch MkAp   = mkAp
           dispatch Unwind = unwind
 
@@ -125,8 +130,8 @@ mkAp state = state { gmStack = addr : rest, gmHeap = heap' }
 
 push :: Int -> GmState -> GmState
 push n state = state { gmStack = addr : stack }
-    where stack        = gmStack state
-          (NAp _ addr) = hLookup (gmHeap state) (stack !! (n + 1))
+    where stack = gmStack state
+          addr  = stack !! n
 
 pop :: Int -> GmState -> GmState
 pop n state = state { gmStack = drop n (gmStack state) }
@@ -136,17 +141,34 @@ update n state = state { gmStack = rest, gmHeap = heap' }
     where (addr:rest) = gmStack state
           heap'       = hUpdate (gmHeap state) (rest !! n) (NInd addr)
 
+slide :: Int -> GmState -> GmState
+slide n state = state { gmStack = addr : drop n rest }
+    where (addr:rest) = gmStack state
+
+alloc :: Int -> GmState -> GmState
+alloc n state = state { gmStack = addrs ++ gmStack state, gmHeap = heap' }
+    where allocNode      = (\h _ -> hAlloc h $ NInd hNull)
+          (heap', addrs) = mapAccuml allocNode (gmHeap state) [1..n]
+
 unwind :: GmState -> GmState
 unwind state = newState (hLookup (gmHeap state) addr)
-    where (addr:rest) = gmStack state
+    where heap  = gmHeap state
+          stack = gmStack state
+
+          (addr:rest) = stack
 
           newState (NNum _)   = state
           newState (NInd a1)  = state { gmCode = [ Unwind ], gmStack = a1:rest }
-          newState (NAp a1 _) = state { gmCode = [ Unwind ], gmStack = a1:addr:rest }
+          newState (NAp a1 _) = state { gmCode = [ Unwind ], gmStack = a1:stack }
 
           newState (NGlobal n code)
             | length rest < n = error "Unwinding with too few arguments"
-            | otherwise       = state { gmCode = code }
+            | otherwise       = state { gmCode = code, gmStack = rearrange n heap stack }
+
+rearrange :: Int -> GmHeap -> GmStack -> GmStack
+rearrange n heap stack = take n (map getArg (tail stack)) ++ drop n stack
+    where getArg addr | (NAp _ arg) <- hLookup heap addr = arg
+                      | otherwise = error "Broken spine: non NAp node encountered"
 
 compile :: CoreProgram -> GmState
 compile program = GmState initialCode [] heap globals statInitial
@@ -177,17 +199,37 @@ argOffset n env = [(v, n+m) | (v,m) <- env]
 compileC :: GmCompiler
 compileC (EVar v) env
     | elem v (aDomain env) = [Push n]
-    | otherwise = [PushGlobal v]
+    | otherwise            = [PushGlobal v]
     where n = aLookup env v (error "Can’t happen")
 
 compileC (ENum n) _      = [PushInt n]
 
 compileC (EAp e1 e2) env = compileC e2 env ++ compileC e1 (argOffset 1 env) ++ [ MkAp ]
 
+compileC (ELet rec defs expr) env
+    | rec       = [ Alloc n ]
+                    ++ compileDefs True defs env'
+                    ++ replicate n (Update $ n - 1)
+                    ++ compileC expr env'
+                    ++ [ Slide n ]
+
+    | otherwise = compileDefs False defs env
+                    ++ compileC expr env'
+                    ++ [ Slide n ]
+
+    where n    = length defs
+          env' = zip (map fst defs) [n-1, n-2 .. 0] ++ argOffset n env
+
 compileC (EConstr _ _) _ = error "EConstr: not yet implemented"
-compileC (ELet _ _ _) _  = error "ELet: not yet implemented"
 compileC (ECase _ _) _   = error "ECase: not yet implemented"
 compileC (ELam _ _) _    = error "ELam: not yet implemented"
+
+compileDefs :: Bool -> [(Name, CoreExpr)] -> GmEnvironment -> GmCode
+compileDefs _ [] _ = []
+
+compileDefs rec ((name, expr):defs) env = compileC expr env ++ compileDefs rec defs env'
+    where env' | rec       = env
+               | otherwise = (name, 0) : argOffset 1 env
 
 compiledPrimitives :: [GmCompiledSC]
 compiledPrimitives = []
@@ -204,9 +246,11 @@ showResults opts states = iDisplay $ iConcat [
     where (s:_) = states
           lastState = last states
 
+          nl2 = iNewline `iAppend` iNewline
+
           scDefOutp | ssSCCode opts   = iInterleave iNewline [
                                             iStr "Supercombinator definitions",
-                                            iInterleave iNewline (map (showSC s) (gmGlobals s)),
+                                            iInterleave nl2 (map (showSC s) (gmGlobals s)),
                                             iNewline
                                         ]
                     | otherwise       = iNil
@@ -226,9 +270,9 @@ showSC s (name, addr) = iConcat [ iStr "Code for ",
     where (NGlobal _ code) = (hLookup (gmHeap s) addr)
 
 showInstructions :: GmCode -> Iseq
-showInstructions is = iConcat [ iStr " Code: {",
-                                iIndent (iInterleave iNewline (map showInstruction is)),
-                                iStr "}", iNewline ]
+showInstructions [] = iStr "Empty"
+showInstructions is = iInterleave iNewline (map showInstruction is)
+
 showInstruction :: Instruction -> Iseq
 showInstruction Unwind  = iStr  "Unwind"
 showInstruction MkAp    = iStr  "MkAp"
@@ -239,6 +283,9 @@ showInstruction (PushGlobal f) = (iStr "PushGlobal ") `iAppend` (iStr f)
 showInstruction (Pop n)    = (iStr "Pop ")    `iAppend` (iNum n)
 showInstruction (Push n)   = (iStr "Push ")   `iAppend` (iNum n)
 showInstruction (Update n) = (iStr "Update ") `iAppend` (iNum n)
+
+showInstruction (Slide n)  = (iStr "Slide ")  `iAppend` (iNum n)
+showInstruction (Alloc n)  = (iStr "Alloc ")  `iAppend` (iNum n)
 
 showState :: ShowStateOptions -> GmState -> Iseq
 showState opts s | null views = iNil
@@ -260,10 +307,7 @@ showState opts s | null views = iNil
                                           stackLines ]
 
 showStack :: GmState -> Iseq
-showStack s = iConcat [ iStr " Stack:[",
-                        iIndent (iInterleave iNewline stackItems),
-                        iStr "]" ]
-
+showStack s = iInterleave iNewline stackItems
     where stackItems = (map (showStackItem s) (reverse (gmStack s)))
 
 showStackItem :: GmState -> Addr -> Iseq

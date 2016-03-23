@@ -1,0 +1,10 @@
+-- fix f = f (fix f);
+
+-- fix = S (K (S I I)) (S (S (K S) K) (K (S I I)));
+-- fix = S S K (S (K (S S (S (S S K)))) K);
+
+fix f = letrec x = f x in x;
+
+fac f n = if (n == 0) 1 (n * f (n-1));
+
+main = fix fac 6

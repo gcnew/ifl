@@ -1,0 +1,5 @@
+pair a b f = f a b;
+
+main = let x = pair 3 4;
+           y = x K1
+        in y
