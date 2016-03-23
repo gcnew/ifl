@@ -22,13 +22,15 @@ type GmCompiler = CoreExpr -> GmEnvironment -> GmCode
 data Node = NNum Int            -- Numbers
           | NAp Addr Addr       -- Applications
           | NGlobal Int GmCode  -- Globals
+          | NInd Addr           -- Indirection
 
 data Instruction = Unwind
                  | PushGlobal Name
                  | PushInt Int
                  | Push Int
                  | MkAp
-                 | Slide Int
+                 | Update Int
+                 | Pop Int
                  deriving (Eq)
 
 data GmState = GmState { gmCode    :: GmCode,     -- Current instruction stream
@@ -86,8 +88,9 @@ step state = dispatch i (state { gmCode = is })
           dispatch (PushGlobal f) = pushGlobal f
           dispatch (PushInt n)    = pushInt n
 
-          dispatch (Push n)  = push n
-          dispatch (Slide n) = slide n
+          dispatch (Pop n)    = pop n
+          dispatch (Push n)   = push n
+          dispatch (Update n) = update n
 
           dispatch MkAp   = mkAp
           dispatch Unwind = unwind
@@ -125,15 +128,20 @@ push n state = state { gmStack = addr : stack }
     where stack        = gmStack state
           (NAp _ addr) = hLookup (gmHeap state) (stack !! (n + 1))
 
-slide :: Int -> GmState -> GmState
-slide n state = state { gmStack = addr : drop n rest }
+pop :: Int -> GmState -> GmState
+pop n state = state { gmStack = drop n (gmStack state) }
+
+update :: Int -> GmState -> GmState
+update n state = state { gmStack = rest, gmHeap = heap' }
     where (addr:rest) = gmStack state
+          heap'       = hUpdate (gmHeap state) (rest !! n) (NInd addr)
 
 unwind :: GmState -> GmState
 unwind state = newState (hLookup (gmHeap state) addr)
     where (addr:rest) = gmStack state
 
           newState (NNum _)   = state
+          newState (NInd a1)  = state { gmCode = [ Unwind ], gmStack = a1:rest }
           newState (NAp a1 _) = state { gmCode = [ Unwind ], gmStack = a1:addr:rest }
 
           newState (NGlobal n code)
@@ -160,7 +168,8 @@ compileSc :: (Name, [Name], CoreExpr) -> GmCompiledSC
 compileSc (name, env, body) = (name, length env, compileR body (zip env [0..]))
 
 compileR :: GmCompiler
-compileR e env = compileC e env ++ [Slide (length env + 1), Unwind]
+compileR e env = compileC e env ++ [ Update n, Pop n, Unwind ]
+    where n = length env
 
 argOffset :: Int -> GmEnvironment -> GmEnvironment
 argOffset n env = [(v, n+m) | (v,m) <- env]
