@@ -7,9 +7,8 @@ space n = replicate n ' '
 
 split :: Eq a => a -> [a] -> [[a]]
 split sep arr = foldr splitter [[]] arr
-    where splitter _ [] = undefined -- should never happen, silence warnings
-          splitter c acc@(x:xs) | c /= sep  = ((c:x):xs)
-                                | otherwise = [] : acc
+    where splitter c acc | c /= sep  = ((c:head acc) : tail acc)
+                         | otherwise = [] : acc
 
 zipNWith :: ([a] -> b) -> [[a]] -> [b]
 zipNWith _ [] = []
