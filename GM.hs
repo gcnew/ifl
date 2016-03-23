@@ -42,13 +42,14 @@ data ShowStateOptions = ShowStateOptions { ssHeap     :: Bool
                                          , ssEnv      :: Bool
                                          , ssDump     :: Bool
                                          , ssLastOnly :: Bool
+                                         , ssSCCode   :: Bool
                                          }
 
 dbgOpts :: ShowStateOptions
-dbgOpts = ShowStateOptions True True True False
+dbgOpts = ShowStateOptions True True True False False
 
 compactOpts :: ShowStateOptions
-compactOpts = ShowStateOptions False False False True
+compactOpts = ShowStateOptions False False False True False
 
 statInitial :: GmStats
 statInitial = 0
@@ -83,7 +84,7 @@ step state = dispatch i (state { gmCode = is })
     where (i:is) = gmCode state
 
           dispatch (PushGlobal f) = pushGlobal f
-          dispatch (PushInt n)    = pushIntMemo n
+          dispatch (PushInt n)    = pushInt n
 
           dispatch (Push n)  = push n
           dispatch (Slide n) = slide n
@@ -184,31 +185,39 @@ compiledPrimitives = []
 
 showResults :: ShowStateOptions -> [GmState] -> [Char]
 showResults opts states = iDisplay $ iConcat [
-                                iStr "Supercombinator definitions", iNewline,
-                                iInterleave iNewline (map (showSC s) (gmGlobals s)),
-                                iNewline, iNewline,
+                                scDefOutp,
                                 iStr "State transitions",
                                 iNewline, iNewline,
                                 stateOutp,
-                                iNewline, iNewline,
+                                iNewline,
                                 showStats lastState
                             ]
     where (s:_) = states
           lastState = last states
 
+          scDefOutp | ssSCCode opts   = iInterleave iNewline [
+                                            iStr "Supercombinator definitions",
+                                            iInterleave iNewline (map (showSC s) (gmGlobals s)),
+                                            iNewline
+                                        ]
+                    | otherwise       = iNil
+
           stateOutp | ssLastOnly opts = showState dbgOpts lastState `iAppend` iNewline
                     | otherwise       = iLayn (map (showState opts) states)
+
+showFWAddr :: Addr -> Iseq -- Show address in field of width 4
+showFWAddr addr = iStr (space (4 - length str) ++ str)
+    where str = showaddr addr
 
 showSC :: GmState -> (Name, Addr) -> Iseq
 showSC s (name, addr) = iConcat [ iStr "Code for ",
                                   iStr name, iNewline,
-                                  showInstructions code,
-                                  iNewline, iNewline ]
+                                  showInstructions code ]
 
     where (NGlobal _ code) = (hLookup (gmHeap s) addr)
 
 showInstructions :: GmCode -> Iseq
-showInstructions is = iConcat [ iStr " Code:{",
+showInstructions is = iConcat [ iStr " Code: {",
                                 iIndent (iInterleave iNewline (map showInstruction is)),
                                 iStr "}", iNewline ]
 showInstruction :: Instruction -> Iseq
@@ -218,8 +227,9 @@ showInstruction MkAp    = iStr  "MkAp"
 showInstruction (PushInt n)    = (iStr "PushInt ") `iAppend` (iNum n)
 showInstruction (PushGlobal f) = (iStr "PushGlobal ") `iAppend` (iStr f)
 
-showInstruction (Push n)  = (iStr "Push ")  `iAppend` (iNum n)
-showInstruction (Slide n) = (iStr "Slide ") `iAppend` (iNum n)
+showInstruction (Pop n)    = (iStr "Pop ")    `iAppend` (iNum n)
+showInstruction (Push n)   = (iStr "Push ")   `iAppend` (iNum n)
+showInstruction (Update n) = (iStr "Update ") `iAppend` (iNum n)
 
 showState :: ShowStateOptions -> GmState -> Iseq
 showState opts s | null views = iNil
@@ -248,22 +258,23 @@ showStack s = iConcat [ iStr " Stack:[",
     where stackItems = (map (showStackItem s) (reverse (gmStack s)))
 
 showStackItem :: GmState -> Addr -> Iseq
-showStackItem s a = iConcat [ iStr (showaddr a),
+showStackItem s a = iConcat [ showFWAddr a,
                               iStr ": ",
                               showNode s a (hLookup (gmHeap s) a) ]
 
 showNode :: GmState -> Addr -> Node -> Iseq
-showNode _ _ (NNum n) = iNum n
+showNode _ _ (NNum n)    = iNum n
+showNode _ _ (NInd addr) = iStr "NInd " `iAppend` showFWAddr addr
 
 showNode s a (NGlobal _ _) = iConcat [ iStr "Global ", iStr v ]
     where v = head [n | (n,b) <- gmGlobals s, a == b]
 
-showNode _ _ (NAp a1 a2) = iConcat [ iStr "Ap ", iStr (showaddr a1),
-                                     iStr " ",   iStr (showaddr a2) ]
+showNode _ _ (NAp a1 a2) = iConcat [ iStr "Ap ", showFWAddr a1,
+                                     iStr " ",   showFWAddr a2 ]
 
 showHeap :: GmState -> Iseq
 showHeap state = iInterleave iNewline (map formatter tuples)
-    where formatter (addr, node) = iConcat [ iStr (showaddr addr),
+    where formatter (addr, node) = iConcat [ showFWAddr addr,
                                              iStr " -> ",
                                              showNode state addr node ]
 
@@ -272,7 +283,7 @@ showHeap state = iInterleave iNewline (map formatter tuples)
 
 showEnv :: GmGlobals -> Iseq
 showEnv = iInterleave iNewline . map formatter
-    where formatter (name, addr) = iConcat [ iStr name, iStr " -> ", iStr (showaddr addr) ]
+    where formatter (name, addr) = iConcat [ iStr name, iStr " -> ", showFWAddr addr ]
 
 showStats :: GmState -> Iseq
 showStats s = iConcat [ iStr "Steps taken = ", iNum (statGetSteps (gmStats s)) ]
