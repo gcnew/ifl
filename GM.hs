@@ -12,8 +12,11 @@ import Main (preludeDefs, lambdaPreludeDefs)
 type GmStats = Int
 type GmStack = [Addr]
 type GmHeap = Heap Node
+type GmDump = [GmDumpItem]
 type GmCode = [Instruction]
 type GmGlobals = ASSOC Name Addr
+
+type GmDumpItem = (GmCode, GmStack)
 
 type GmEnvironment = ASSOC Name Int
 type GmCompiledSC = (Name, Int, GmCode)
@@ -33,10 +36,16 @@ data Instruction = Unwind
                  | Pop Int
                  | Slide Int
                  | Alloc Int
+                 | Eval
+                 | Abort
+                 | Add | Sub | Mul | Div | Neg
+                 | Eq | Ne | Lt | Le | Gt | Ge
+                 | Cond GmCode GmCode
                  deriving (Eq, Show)
 
 data GmState = GmState { gmCode    :: GmCode,     -- Current instruction stream
                          gmStack   :: GmStack,    -- Current stack
+                         gmDump    :: GmDump,
                          gmHeap    :: GmHeap,     -- Heap of nodes
                          gmGlobals :: GmGlobals,  -- Global addresses in heap
                          gmStats   :: GmStats     -- Statistics
@@ -99,6 +108,24 @@ step state = dispatch i (state { gmCode = is })
 
           dispatch MkAp   = mkAp
           dispatch Unwind = unwind
+          dispatch Eval   = forceEval
+          dispatch Abort  = error "Core: abort"
+
+          dispatch Neg = aritmetic1 negate
+
+          dispatch Add = aritmetic2 (+)
+          dispatch Sub = aritmetic2 (-)
+          dispatch Mul = aritmetic2 (*)
+          dispatch Div = aritmetic2 div
+
+          dispatch Eq = comparison (==)
+          dispatch Ne = comparison (/=)
+          dispatch Lt = comparison (<)
+          dispatch Le = comparison (<=)
+          dispatch Gt = comparison (>)
+          dispatch Ge = comparison (>=)
+
+          dispatch (Cond ifTrue ifFalse) = primCond ifTrue ifFalse
 
 pushGlobal :: Name -> GmState -> GmState
 pushGlobal name state = state { gmStack = addr : (gmStack state) }
@@ -150,14 +177,36 @@ alloc n state = state { gmStack = addrs ++ gmStack state, gmHeap = heap' }
     where allocNode      = (\h _ -> hAlloc h $ NInd hNull)
           (heap', addrs) = mapAccuml allocNode (gmHeap state) [1..n]
 
+isDataNode :: Node -> Bool
+isDataNode (NNum _) = True
+isDataNode _        = False
+
+forceEval :: GmState -> GmState
+forceEval state
+    | isDataNode node = state
+    | otherwise       = state { gmCode  = [ Unwind ],
+                                gmStack = [ addr ],
+                                gmDump  = (code, rest) : dump }
+    where stack = gmStack state
+          code  = gmCode state
+          dump  = gmDump state
+
+          (addr:rest) = stack
+          node        = hLookup (gmHeap state) addr
+
 unwind :: GmState -> GmState
-unwind state = newState (hLookup (gmHeap state) addr)
+unwind state = newState (hLookup heap addr)
     where heap  = gmHeap state
           stack = gmStack state
+          dump  = gmDump state
 
           (addr:rest) = stack
 
-          newState (NNum _)   = state
+          newState (NNum _)
+            | ((code, stack') : dump') <- dump
+                = state { gmCode = code, gmStack = addr : stack', gmDump = dump' }
+            | otherwise = state
+
           newState (NInd a1)  = state { gmCode = [ Unwind ], gmStack = a1:rest }
           newState (NAp a1 _) = state { gmCode = [ Unwind ], gmStack = a1:stack }
 
@@ -171,16 +220,17 @@ rearrange n heap stack = take n (map getArg (tail stack)) ++ drop n stack
                       | otherwise = error "Broken spine: non NAp node encountered"
 
 compile :: CoreProgram -> GmState
-compile program = GmState initialCode [] heap globals statInitial
+compile program = GmState initialCode [] [] heap globals statInitial
     where scDefs = program ++ preludeDefs ++ lambdaPreludeDefs
           (heap, globals) = buildInitialHeap scDefs
 
 initialCode :: GmCode
-initialCode = [ PushGlobal "main", Unwind ]
+initialCode = [ PushGlobal "main", Unwind ] -- no idea why we need Eval,
+                                            -- Unwind works just fine..
 
 buildInitialHeap :: CoreProgram -> (GmHeap, GmGlobals)
 buildInitialHeap prog = mapAccuml allocateSc hInitial compiled
-    where compiled = map compileSc prog
+    where compiled = map compileSc prog ++ compiledPrimitives
 
 allocateSc :: GmHeap -> GmCompiledSC -> (GmHeap, (Name, Addr))
 allocateSc heap (name, nargs, instns) = (heap', (name, addr))
@@ -231,8 +281,87 @@ compileDefs rec ((name, expr):defs) env = compileC expr env ++ compileDefs rec d
     where env' | rec       = env
                | otherwise = (name, 0) : argOffset 1 env
 
+primCond :: GmCode -> GmCode -> GmState -> GmState
+primCond ifTrue ifFalse state = state { gmCode = code' ++ gmCode state, gmStack = stack' }
+    where (addr:stack') = gmStack state
+          code' | unboxBoolean addr state = ifTrue
+                | otherwise               = ifFalse
+
+boxInteger :: Int -> GmState -> GmState
+boxInteger n state = state { gmStack = addr : gmStack state, gmHeap = heap' }
+    where (heap', addr) = hAlloc (gmHeap state) (NNum n)
+
+unboxInteger :: Addr -> GmState -> Int
+unboxInteger addr state = case hLookup (gmHeap state) addr of
+        (NNum n) -> n
+        _        -> error "Unboxing a non-integer"
+
+boxBoolean :: Bool -> GmState -> GmState
+boxBoolean b state = state { gmStack = addr : gmStack state, gmHeap = heap' }
+    where (heap', addr) = hAlloc (gmHeap state) (findPrimDef key)
+
+          findPrimDef prim = NInd (aLookup (gmGlobals state) prim err)
+              where err = error $ "Primitive definition `" ++ prim ++ "` not found!"
+
+          key | b         = "True"
+              | otherwise = "False"
+
+unboxBoolean :: Addr -> GmState -> Bool
+unboxBoolean addr state = case hLookup (gmHeap state) addr of
+        (NNum 1) -> True
+        (NNum 0) -> False
+        _        -> error "Unboxing a non-boolean"
+
+primitive1 :: (a -> GmState -> GmState)  -- boxing function
+              -> (Addr -> GmState -> b)  -- unboxing function
+              -> (b -> a)                -- operator
+              -> GmState -> GmState      -- in state & retval
+primitive1 box unbox op state = box (op (unbox addr state)) (state { gmStack = stack' })
+    where (addr:stack') = gmStack state
+
+primitive2 :: (a -> GmState -> GmState)  -- boxing function
+              -> (Addr -> GmState -> b)  -- unboxing function
+              -> (b -> b -> a)           -- operator
+              -> GmState -> GmState      -- in state & retval
+primitive2 box unbox op state = box result (state { gmStack = stack' })
+    where (a1:a2:stack') = gmStack state
+          result         = unbox a1 state `op` unbox a2 state
+
+aritmetic1 :: (Int -> Int) -> GmState -> GmState
+aritmetic1 = primitive1 boxInteger unboxInteger
+
+aritmetic2 :: (Int -> Int -> Int) -> GmState -> GmState
+aritmetic2 = primitive2 boxInteger unboxInteger
+
+comparison :: (Int -> Int -> Bool) -> GmState -> GmState
+comparison = primitive2 boxBoolean unboxInteger
+
 compiledPrimitives :: [GmCompiledSC]
-compiledPrimitives = []
+compiledPrimitives = map primCC [
+        ("negate", 1, Neg),
+
+        ("+", 2, Add), ("-", 2, Sub),
+        ("*", 2, Mul), ("/", 2, Div),
+
+        ( ">", 2, Gt), (">=", 2, Ge),
+        ( "<", 2, Lt), ("<=", 2, Le),
+        ("==", 2, Eq), ("/=", 2, Ne)
+    ] ++ [
+        ("True", 0, [ PushInt 1, Update 0, Pop 0, Unwind ]),
+        ("False", 0, [ PushInt 0, Update 0, Pop 0, Unwind ]),
+
+        ("abort", 0, [ Abort ]),
+
+        ("if", 3, [ Push 0, Eval,
+                    Cond [Push 1] [Push 2],
+                    Update 3, Pop 3, Unwind ])
+    ]
+
+primCC :: (Name, Int, Instruction) -> GmCompiledSC
+primCC (name, arity, ins) = (name, arity, force ++ [ ins ] ++ clean)
+    where n     = arity - 1
+          force = concat $ replicate arity [ Push n, Eval ]
+          clean = [ Update arity, Pop arity, Unwind ]
 
 showResults :: ShowStateOptions -> [GmState] -> [Char]
 showResults opts states = iDisplay $ iConcat [
@@ -274,8 +403,9 @@ showInstructions [] = iStr "Empty"
 showInstructions is = iInterleave iNewline (map showInstruction is)
 
 showInstruction :: Instruction -> Iseq
-showInstruction Unwind  = iStr  "Unwind"
-showInstruction MkAp    = iStr  "MkAp"
+showInstruction Unwind  = iStr "Unwind"
+showInstruction MkAp    = iStr "MkAp"
+showInstruction Abort   = iStr "Abort"
 
 showInstruction (PushInt n)    = (iStr "PushInt ") `iAppend` (iNum n)
 showInstruction (PushGlobal f) = (iStr "PushGlobal ") `iAppend` (iStr f)
@@ -287,11 +417,29 @@ showInstruction (Update n) = (iStr "Update ") `iAppend` (iNum n)
 showInstruction (Slide n)  = (iStr "Slide ")  `iAppend` (iNum n)
 showInstruction (Alloc n)  = (iStr "Alloc ")  `iAppend` (iNum n)
 
+showInstruction Eval = iStr "Eval"
+showInstruction (Cond _ _) = iStr "Cond"
+
+showInstruction Add  = iStr "Add"
+showInstruction Sub  = iStr "Sub"
+showInstruction Mul  = iStr "Mul"
+showInstruction Div  = iStr "Div"
+showInstruction Neg  = iStr "Neg"
+
+showInstruction Eq   = iStr "Eq"
+showInstruction Ne   = iStr "Ne"
+showInstruction Lt   = iStr "Lt"
+showInstruction Le   = iStr "Le"
+showInstruction Gt   = iStr "Gt"
+showInstruction Ge   = iStr "Ge"
+
 showState :: ShowStateOptions -> GmState -> Iseq
 showState opts s | null views = iNil
                  | otherwise  = iSplitView views `iAppend` iNewline
 
     where stackLines = showStack s
+
+          dumpLines = showDump s
 
           codeLines  = showInstructions (gmCode s)
 
@@ -304,7 +452,8 @@ showState opts s | null views = iNil
           views = filter (not . iIsNil) [ heapLines,
                                           envLines,
                                           codeLines,
-                                          stackLines ]
+                                          stackLines,
+                                          dumpLines ]
 
 showStack :: GmState -> Iseq
 showStack s = iInterleave iNewline stackItems
@@ -325,6 +474,26 @@ showNode s a (NGlobal _ _) = iConcat [ iStr "Global ", iStr v ]
 showNode _ _ (NAp a1 a2) = iConcat [ iStr "Ap ", showFWAddr a1,
                                      iStr " ",   showFWAddr a2 ]
 
+showDump :: GmState -> Iseq
+showDump s = iConcat [ iStr " Dump: [",
+                       iIndent (iInterleave iNewline dumpItems),
+                       iStr "]" ]
+    where dumpItems = map showDumpItem (reverse (gmDump s))
+
+showDumpItem :: GmDumpItem -> Iseq
+showDumpItem (code, stack) = iConcat [ iStr "<",
+                                       shortShowInstructions 3 code,
+                                       iStr ", ",
+                                       shortShowStack stack, iStr ">" ]
+
+shortShowInstructions :: Int -> GmCode -> Iseq
+shortShowInstructions n code = iConcat [ iStr "{",
+                                         iInterleave (iStr "; ") dotcodes,
+                                         iStr "}" ]
+    where codes = map showInstruction (take n code)
+          dotcodes | length code > n = codes ++ [ iStr "..." ]
+                   | otherwise = codes
+
 showHeap :: GmState -> Iseq
 showHeap state = iInterleave iNewline (map formatter tuples)
     where formatter (addr, node) = iConcat [ showFWAddr addr,
@@ -333,6 +502,11 @@ showHeap state = iInterleave iNewline (map formatter tuples)
 
           heap   = gmHeap state
           tuples =  [ (addr, hLookup heap addr) | addr <- hAddresses heap ]
+
+shortShowStack :: GmStack -> Iseq
+shortShowStack stack = iConcat [ iStr "[",
+                                 iInterleave (iStr ", ") (map showFWAddr stack),
+                                 iStr "]" ]
 
 showEnv :: GmGlobals -> Iseq
 showEnv = iInterleave iNewline . map formatter
