@@ -38,9 +38,9 @@ data Instruction = Unwind
                  | Alloc Int
                  | Eval
                  | Abort
+                 | Cond
                  | Add | Sub | Mul | Div | Neg
                  | Eq | Ne | Lt | Le | Gt | Ge
-                 | Cond GmCode GmCode
                  deriving (Eq, Show)
 
 data GmState = GmState { gmCode    :: GmCode,     -- Current instruction stream
@@ -125,7 +125,7 @@ step state = dispatch i (state { gmCode = is })
           dispatch Gt = comparison (>)
           dispatch Ge = comparison (>=)
 
-          dispatch (Cond ifTrue ifFalse) = primCond ifTrue ifFalse
+          dispatch Cond = primCond
 
 pushGlobal :: Name -> GmState -> GmState
 pushGlobal name state = state { gmStack = addr : (gmStack state) }
@@ -281,11 +281,11 @@ compileDefs rec ((name, expr):defs) env = compileC expr env ++ compileDefs rec d
     where env' | rec       = env
                | otherwise = (name, 0) : argOffset 1 env
 
-primCond :: GmCode -> GmCode -> GmState -> GmState
-primCond ifTrue ifFalse state = state { gmCode = code' ++ gmCode state, gmStack = stack' }
+primCond :: GmState -> GmState
+primCond state = state { gmCode = code' : gmCode state, gmStack = stack' }
     where (addr:stack') = gmStack state
-          code' | unboxBoolean addr state = ifTrue
-                | otherwise               = ifFalse
+          code' | unboxBoolean addr state = Push 1
+                | otherwise               = Push 2
 
 boxInteger :: Int -> GmState -> GmState
 boxInteger n state = state { gmStack = addr : gmStack state, gmHeap = heap' }
@@ -352,15 +352,13 @@ compiledPrimitives = map primCC [
 
         ("abort", 0, [ Abort ]),
 
-        ("if", 3, [ Push 0, Eval,
-                    Cond [Push 1] [Push 2],
+        ("if", 3, [ Push 0, Eval, Cond,
                     Update 3, Pop 3, Unwind ])
     ]
 
 primCC :: (Name, Int, Instruction) -> GmCompiledSC
 primCC (name, arity, ins) = (name, arity, force ++ [ ins ] ++ clean)
-    where n     = arity - 1
-          force = concat $ replicate arity [ Push n, Eval ]
+    where force = concat $ replicate arity [ Push (arity - 1), Eval ]
           clean = [ Update arity, Pop arity, Unwind ]
 
 showResults :: ShowStateOptions -> [GmState] -> [Char]
@@ -418,7 +416,7 @@ showInstruction (Slide n)  = (iStr "Slide ")  `iAppend` (iNum n)
 showInstruction (Alloc n)  = (iStr "Alloc ")  `iAppend` (iNum n)
 
 showInstruction Eval = iStr "Eval"
-showInstruction (Cond _ _) = iStr "Cond"
+showInstruction Cond = iStr "Cond"
 
 showInstruction Add  = iStr "Add"
 showInstruction Sub  = iStr "Sub"
