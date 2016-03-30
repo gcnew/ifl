@@ -1,2 +1,2 @@
 a x y = x + y;
-main = (if True a False) 3 4
+main = (if (1 > 0) a (1 / 0)) 3 4

@@ -2,12 +2,14 @@
 
 module GM where
 
+import Data.List (find, foldl')
+
 import AST
 import Heap
 import Iseq
 import Utils
 import Parser (parse)
-import Main (preludeDefs, lambdaPreludeDefs)
+import Main (preludeDefs)
 
 type GmStats = Int
 type GmStack = [Addr]
@@ -38,9 +40,9 @@ data Instruction = Unwind
                  | Alloc Int
                  | Eval
                  | Abort
-                 | Cond
                  | Add | Sub | Mul | Div | Neg
                  | Eq | Ne | Lt | Le | Gt | Ge
+                 | Cond [Instruction] [Instruction]
                  deriving (Eq, Show)
 
 data GmState = GmState { gmCode    :: GmCode,     -- Current instruction stream
@@ -59,7 +61,7 @@ data ShowStateOptions = ShowStateOptions { ssHeap     :: Bool
                                          }
 
 dbgOpts :: ShowStateOptions
-dbgOpts = ShowStateOptions True True True False False
+dbgOpts = ShowStateOptions True True True False True
 
 compactOpts :: ShowStateOptions
 compactOpts = ShowStateOptions False False False True False
@@ -125,7 +127,7 @@ step state = dispatch i (state { gmCode = is })
           dispatch Gt = comparison (>)
           dispatch Ge = comparison (>=)
 
-          dispatch Cond = primCond
+          dispatch (Cond ifTrue ifFalse) = primCond ifTrue ifFalse
 
 pushGlobal :: Name -> GmState -> GmState
 pushGlobal name state = state { gmStack = addr : (gmStack state) }
@@ -163,10 +165,17 @@ push n state = state { gmStack = addr : stack }
 pop :: Int -> GmState -> GmState
 pop n state = state { gmStack = drop n (gmStack state) }
 
+-- update should create NInd node according to the book.
+-- the current implementation directly updates the node
+-- saving clutter and.. <indirections>
+-- are there any negative consequences I have missed?
 update :: Int -> GmState -> GmState
 update n state = state { gmStack = rest, gmHeap = heap' }
     where (addr:rest) = gmStack state
-          heap'       = hUpdate (gmHeap state) (rest !! n) (NInd addr)
+          heap        = gmHeap state
+          -- node        = NInd addr
+          node        = hLookup heap addr
+          heap'       = hUpdate heap (rest !! n) node
 
 slide :: Int -> GmState -> GmState
 slide n state = state { gmStack = addr : drop n rest }
@@ -211,8 +220,15 @@ unwind state = newState (hLookup heap addr)
           newState (NAp a1 _) = state { gmCode = [ Unwind ], gmStack = a1:stack }
 
           newState (NGlobal n code)
-            | length rest < n = error "Unwinding with too few arguments"
-            | otherwise       = state { gmCode = code, gmStack = rearrange n heap stack }
+            | nArgs < n = case dump of
+                ((code', stack') : dump') -> state { gmCode = code',
+                                                     gmStack = last stack : stack',
+                                                     gmDump = dump' }
+
+                _                         -> error "Unwinding with too few arguments"
+
+            | otherwise = state { gmCode = code, gmStack = rearrange n heap stack }
+            where nArgs = length rest
 
 rearrange :: Int -> GmHeap -> GmStack -> GmStack
 rearrange n heap stack = take n (map getArg (tail stack)) ++ drop n stack
@@ -221,7 +237,7 @@ rearrange n heap stack = take n (map getArg (tail stack)) ++ drop n stack
 
 compile :: CoreProgram -> GmState
 compile program = GmState initialCode [] [] heap globals statInitial
-    where scDefs = program ++ preludeDefs ++ lambdaPreludeDefs
+    where scDefs = program ++ preludeDefs
           (heap, globals) = buildInitialHeap scDefs
 
 initialCode :: GmCode
@@ -240,7 +256,7 @@ compileSc :: (Name, [Name], CoreExpr) -> GmCompiledSC
 compileSc (name, env, body) = (name, length env, compileR body (zip env [0..]))
 
 compileR :: GmCompiler
-compileR e env = compileC e env ++ [ Update n, Pop n, Unwind ]
+compileR e env = compileE e env ++ [ Update n, Pop n, Unwind ]
     where n = length env
 
 argOffset :: Int -> GmEnvironment -> GmEnvironment
@@ -255,24 +271,67 @@ compileC (EVar v) env
 compileC (ENum n) _      = [PushInt n]
 
 compileC (EAp e1 e2) env = compileC e2 env ++ compileC e1 (argOffset 1 env) ++ [ MkAp ]
+compileC (ELet rec defs expr) env = compileLet compileC rec defs expr env
 
-compileC (ELet rec defs expr) env
+compileC (EConstr _ _) _ = error "compileC: EConstr: not yet implemented"
+compileC (ECase _ _) _   = error "compileC: ECase: not yet implemented"
+compileC (ELam _ _) _    = error "compileC: ELam: not yet implemented"
+
+compileE :: GmCompiler
+compileE (ENum n) _               = [PushInt n]
+compileE (ELet rec defs expr) env = compileLet compileE rec defs expr env
+
+-- Lambda If is broken now.. will be fixed when Data constructors are
+-- implemented and primitive Cond removed
+compileE node env
+    | (EVar "if" : ifCond : ifTrue : ifFalse : aps) <- unfolded,
+      False                  <- elem "if" (aDomain env)  -- and not a local variable
+        = let nAps   = length aps
+              env'   = argOffset nAps env
+              ifCode = compileE ifCond env'
+                        ++ [ Cond (compileE ifTrue  env')
+                                  (compileE ifFalse env') ]
+              (_, code) = foldl' (comp compileC) (nAps - 1, ifCode) aps
+           in code ++ replicate nAps MkAp
+
+    | (EVar op : aps)        <- unfold node [],
+      Just (_, arity, instr) <- findBuiltIn op,        -- it is a built-in
+      False                  <- elem op (aDomain env)  -- and not a local variable
+                                                       -- can't check for prelude :(
+        = let strictAps = take arity aps
+              lazyAps   = drop arity aps
+              strictRes = foldl' (comp compileE) (length aps - 1, instr) strictAps
+              (_, code) = foldl' (comp compileC) strictRes lazyAps
+           in code ++ replicate (length lazyAps) MkAp -- operator MkAp nodes are needed only in
+                                                      -- lambda prelude
+                                                      -- e.g.: (1 > 0) 5 6
+
+    | otherwise = compileC node env ++ [ Eval ]
+
+    where unfold (EAp e1 e2) acc = unfold e1 (e2 : acc)
+          unfold n acc           = n : acc
+
+          unfolded = unfold node []
+
+          findBuiltIn op = find (\(name, _, _) -> name == op) buildIns
+
+          comp cc (offset, code) expr = let env' = argOffset offset env
+                                         in (offset - 1, cc expr env' ++ code)
+
+compileLet :: GmCompiler -> Bool -> [(Name, CoreExpr)] -> GmCompiler
+compileLet compiler rec defs expr env
     | rec       = [ Alloc n ]
                     ++ compileDefs True defs env'
                     ++ replicate n (Update $ n - 1)
-                    ++ compileC expr env'
+                    ++ compiler expr env'
                     ++ [ Slide n ]
 
     | otherwise = compileDefs False defs env
-                    ++ compileC expr env'
+                    ++ compiler expr env'
                     ++ [ Slide n ]
 
     where n    = length defs
           env' = zip (map fst defs) [n-1, n-2 .. 0] ++ argOffset n env
-
-compileC (EConstr _ _) _ = error "EConstr: not yet implemented"
-compileC (ECase _ _) _   = error "ECase: not yet implemented"
-compileC (ELam _ _) _    = error "ELam: not yet implemented"
 
 compileDefs :: Bool -> [(Name, CoreExpr)] -> GmEnvironment -> GmCode
 compileDefs _ [] _ = []
@@ -281,11 +340,11 @@ compileDefs rec ((name, expr):defs) env = compileC expr env ++ compileDefs rec d
     where env' | rec       = env
                | otherwise = (name, 0) : argOffset 1 env
 
-primCond :: GmState -> GmState
-primCond state = state { gmCode = code' : gmCode state, gmStack = stack' }
+primCond :: GmCode -> GmCode -> GmState -> GmState
+primCond ifTrue ifFalse state = state { gmCode = code' ++ gmCode state, gmStack = stack' }
     where (addr:stack') = gmStack state
-          code' | unboxBoolean addr state = Push 1
-                | otherwise               = Push 2
+          code' | unboxBoolean addr state = ifTrue
+                | otherwise               = ifFalse
 
 boxInteger :: Int -> GmState -> GmState
 boxInteger n state = state { gmStack = addr : gmStack state, gmHeap = heap' }
@@ -336,28 +395,30 @@ aritmetic2 = primitive2 boxInteger unboxInteger
 comparison :: (Int -> Int -> Bool) -> GmState -> GmState
 comparison = primitive2 boxBoolean unboxInteger
 
+buildIns :: [(Name, Int, GmCode)]  -- (name, arity, instruction)
+buildIns = [ ("negate", 1, [Neg]),
+
+             ("+", 2, [Add]), ("-", 2, [Sub]),
+             ("*", 2, [Mul]), ("/", 2, [Div]),
+
+             ( ">", 2, [Gt, Eval]), (">=", 2, [Ge, Eval]),
+             ( "<", 2, [Lt, Eval]), ("<=", 2, [Le, Eval]),
+             ("==", 2, [Eq, Eval]), ("/=", 2, [Ne, Eval]) ]
+
 compiledPrimitives :: [GmCompiledSC]
-compiledPrimitives = map primCC [
-        ("negate", 1, Neg),
-
-        ("+", 2, Add), ("-", 2, Sub),
-        ("*", 2, Mul), ("/", 2, Div),
-
-        ( ">", 2, Gt), (">=", 2, Ge),
-        ( "<", 2, Lt), ("<=", 2, Le),
-        ("==", 2, Eq), ("/=", 2, Ne)
-    ] ++ [
+compiledPrimitives = map builtInCC buildIns ++ [
         ("True", 0, [ PushInt 1, Update 0, Pop 0, Unwind ]),
         ("False", 0, [ PushInt 0, Update 0, Pop 0, Unwind ]),
 
         ("abort", 0, [ Abort ]),
 
-        ("if", 3, [ Push 0, Eval, Cond,
+        ("if", 3, [ Push 0, Eval,
+                    Cond [Push 1] [Push 2],
                     Update 3, Pop 3, Unwind ])
     ]
 
-primCC :: (Name, Int, Instruction) -> GmCompiledSC
-primCC (name, arity, ins) = (name, arity, force ++ [ ins ] ++ clean)
+builtInCC :: (Name, Int, GmCode) -> GmCompiledSC
+builtInCC (name, arity, ins) = (name, arity, force ++ ins ++ clean)
     where force = concat $ replicate arity [ Push (arity - 1), Eval ]
           clean = [ Update arity, Pop arity, Unwind ]
 
@@ -416,7 +477,7 @@ showInstruction (Slide n)  = (iStr "Slide ")  `iAppend` (iNum n)
 showInstruction (Alloc n)  = (iStr "Alloc ")  `iAppend` (iNum n)
 
 showInstruction Eval = iStr "Eval"
-showInstruction Cond = iStr "Cond"
+showInstruction (Cond _ _) = iStr "Cond"
 
 showInstruction Add  = iStr "Add"
 showInstruction Sub  = iStr "Sub"
@@ -467,7 +528,11 @@ showNode _ _ (NNum n)    = iNum n
 showNode _ _ (NInd addr) = iStr "NInd " `iAppend` showFWAddr addr
 
 showNode s a (NGlobal _ _) = iConcat [ iStr "Global ", iStr v ]
-    where v = head [n | (n,b) <- gmGlobals s, a == b]
+    where v | (name:_) <- [n | (n,b) <- gmGlobals s, a == b] = name
+
+            -- happens with lambda prelude and direct updates instead
+            -- of indirection
+            | otherwise                                      = "Unknown"
 
 showNode _ _ (NAp a1 a2) = iConcat [ iStr "Ap ", showFWAddr a1,
                                      iStr " ",   showFWAddr a2 ]
