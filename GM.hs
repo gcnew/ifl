@@ -13,6 +13,7 @@ import Main (preludeDefs)
 
 type GmStats = Int
 type GmStack = [Addr]
+type GmOutput = [Int]
 type GmHeap = Heap Node
 type GmDump = [GmDumpItem]
 type GmCode = [Instruction]
@@ -28,6 +29,7 @@ data Node = NNum Int            -- Numbers
           | NAp Addr Addr       -- Applications
           | NGlobal Int GmCode  -- Globals
           | NInd Addr           -- Indirection
+          | NConstr Int [Addr]  -- Tag, list of components
 
 data Instruction = Unwind
                  | PushGlobal Name
@@ -39,17 +41,21 @@ data Instruction = Unwind
                  | Slide Int
                  | Alloc Int
                  | Eval
+                 | Pack Int Int
+                 | CaseJump [(Int, GmCode)]
+                 | Split Int
+                 | Print
                  | Abort
                  | Add | Sub | Mul | Div | Neg
                  | Eq | Ne | Lt | Le | Gt | Ge
-                 | Cond [Instruction] [Instruction]
                  deriving (Eq, Show)
 
 data GmState = GmState { gmCode    :: GmCode,     -- Current instruction stream
                          gmStack   :: GmStack,    -- Current stack
-                         gmDump    :: GmDump,
+                         gmDump    :: GmDump,     -- Stack of Code/Stack pairs
                          gmHeap    :: GmHeap,     -- Heap of nodes
                          gmGlobals :: GmGlobals,  -- Global addresses in heap
+                         gmOutput  :: GmOutput,   -- Execution output
                          gmStats   :: GmStats     -- Statistics
                        }
 
@@ -111,6 +117,8 @@ step state = dispatch i (state { gmCode = is })
           dispatch MkAp   = mkAp
           dispatch Unwind = unwind
           dispatch Eval   = forceEval
+          dispatch Print  = primPrint
+
           dispatch Abort  = error "Core: abort"
 
           dispatch Neg = aritmetic1 negate
@@ -127,7 +135,9 @@ step state = dispatch i (state { gmCode = is })
           dispatch Gt = comparison (>)
           dispatch Ge = comparison (>=)
 
-          dispatch (Cond ifTrue ifFalse) = primCond ifTrue ifFalse
+          dispatch (Pack tag arity) = pack tag arity
+          dispatch (CaseJump jl)    = caseJump jl
+          dispatch (Split n)        = constrSplit n
 
 pushGlobal :: Name -> GmState -> GmState
 pushGlobal name state = state { gmStack = addr : (gmStack state) }
@@ -187,8 +197,9 @@ alloc n state = state { gmStack = addrs ++ gmStack state, gmHeap = heap' }
           (heap', addrs) = mapAccuml allocNode (gmHeap state) [1..n]
 
 isDataNode :: Node -> Bool
-isDataNode (NNum _) = True
-isDataNode _        = False
+isDataNode (NNum _)      = True
+isDataNode (NConstr _ _) = True
+isDataNode _             = False
 
 forceEval :: GmState -> GmState
 forceEval state
@@ -203,6 +214,45 @@ forceEval state
           (addr:rest) = stack
           node        = hLookup (gmHeap state) addr
 
+primPrint :: GmState -> GmState
+primPrint state = state { gmStack = rest, gmOutput = out : gmOutput state }
+    where (addr:rest) = gmStack state
+          node = hLookup (gmHeap state) addr
+
+          out | (NNum n) <- node = n
+              | otherwise        = error "Print: number expected"
+
+pack :: Int -> Int -> GmState -> GmState
+pack tag arity state
+    | length stack /= arity = error "NConstr: not enough arguments"
+    | otherwise             = state { gmStack = addr : rest, gmHeap = heap' }
+
+    where stack = gmStack state
+          parts = take arity stack
+          rest  = drop arity stack
+
+          (heap', addr) = hAlloc (gmHeap state) (NConstr tag parts)
+
+
+caseJump :: [(Int, GmCode)] -> GmState -> GmState
+caseJump jumpLocs state = state { gmCode = code' ++ gmCode state, gmStack = rest }
+    where (addr:rest) = gmStack state
+          node = hLookup (gmHeap state) addr
+
+          code' | (NConstr tag _) <- node
+                    = aLookup jumpLocs tag (error "Case: no handler matched")
+
+                | otherwise = error "Case: not a constructor node"
+
+constrSplit :: Int -> GmState -> GmState
+constrSplit n state = state { gmStack = parts ++ rest }
+    where (addr:rest) = gmStack state
+          node = hLookup (gmHeap state) addr
+
+          parts | (NConstr _ as) <- node, length as == n
+                    = as
+                | otherwise = error "Split: not a constructor node or wrong arity"
+
 unwind :: GmState -> GmState
 unwind state = newState (hLookup heap addr)
     where heap  = gmHeap state
@@ -211,10 +261,13 @@ unwind state = newState (hLookup heap addr)
 
           (addr:rest) = stack
 
-          newState (NNum _)
+          unwindData
             | ((code, stack') : dump') <- dump
                 = state { gmCode = code, gmStack = addr : stack', gmDump = dump' }
             | otherwise = state
+
+          newState (NNum _)      = unwindData
+          newState (NConstr _ _) = unwindData
 
           newState (NInd a1)  = state { gmCode = [ Unwind ], gmStack = a1:rest }
           newState (NAp a1 _) = state { gmCode = [ Unwind ], gmStack = a1:stack }
@@ -236,7 +289,7 @@ rearrange n heap stack = take n (map getArg (tail stack)) ++ drop n stack
                       | otherwise = error "Broken spine: non NAp node encountered"
 
 compile :: CoreProgram -> GmState
-compile program = GmState initialCode [] [] heap globals statInitial
+compile program = GmState initialCode [] [] heap globals [] statInitial
     where scDefs = program ++ preludeDefs
           (heap, globals) = buildInitialHeap scDefs
 
@@ -284,20 +337,9 @@ compileE (ELet rec defs expr) env = compileLet compileE rec defs expr env
 -- Lambda If is broken now.. will be fixed when Data constructors are
 -- implemented and primitive Cond removed
 compileE node env
-    | (EVar "if" : ifCond : ifTrue : ifFalse : aps) <- unfolded,
-      False                  <- elem "if" (aDomain env)  -- and not a local variable
-        = let nAps   = length aps
-              env'   = argOffset nAps env
-              ifCode = compileE ifCond env'
-                        ++ [ Cond (compileE ifTrue  env')
-                                  (compileE ifFalse env') ]
-              (_, code) = foldl' (comp compileC) (nAps - 1, ifCode) aps
-           in code ++ replicate nAps MkAp
-
     | (EVar op : aps)        <- unfold node [],
       Just (_, arity, instr) <- findBuiltIn op,        -- it is a built-in
       False                  <- elem op (aDomain env)  -- and not a local variable
-                                                       -- can't check for prelude :(
         = let strictAps = take arity aps
               lazyAps   = drop arity aps
               strictRes = foldl' (comp compileE) (length aps - 1, instr) strictAps
@@ -310,8 +352,6 @@ compileE node env
 
     where unfold (EAp e1 e2) acc = unfold e1 (e2 : acc)
           unfold n acc           = n : acc
-
-          unfolded = unfold node []
 
           findBuiltIn op = find (\(name, _, _) -> name == op) buildIns
 
@@ -339,12 +379,6 @@ compileDefs _ [] _ = []
 compileDefs rec ((name, expr):defs) env = compileC expr env ++ compileDefs rec defs env'
     where env' | rec       = env
                | otherwise = (name, 0) : argOffset 1 env
-
-primCond :: GmCode -> GmCode -> GmState -> GmState
-primCond ifTrue ifFalse state = state { gmCode = code' ++ gmCode state, gmStack = stack' }
-    where (addr:stack') = gmStack state
-          code' | unboxBoolean addr state = ifTrue
-                | otherwise               = ifFalse
 
 boxInteger :: Int -> GmState -> GmState
 boxInteger n state = state { gmStack = addr : gmStack state, gmHeap = heap' }
@@ -410,11 +444,7 @@ compiledPrimitives = map builtInCC buildIns ++ [
         ("True", 0, [ PushInt 1, Update 0, Pop 0, Unwind ]),
         ("False", 0, [ PushInt 0, Update 0, Pop 0, Unwind ]),
 
-        ("abort", 0, [ Abort ]),
-
-        ("if", 3, [ Push 0, Eval,
-                    Cond [Push 1] [Push 2],
-                    Update 3, Pop 3, Unwind ])
+        ("abort", 0, [ Abort ])
     ]
 
 builtInCC :: (Name, Int, GmCode) -> GmCompiledSC
@@ -422,12 +452,14 @@ builtInCC (name, arity, ins) = (name, arity, force ++ ins ++ clean)
     where force = concat $ replicate arity [ Push (arity - 1), Eval ]
           clean = [ Update arity, Pop arity, Unwind ]
 
-showResults :: ShowStateOptions -> [GmState] -> [Char]
+showResults :: ShowStateOptions -> [GmState] -> String
 showResults opts states = iDisplay $ iConcat [
                                 scDefOutp,
                                 iStr "State transitions",
                                 iNewline, iNewline,
                                 stateOutp,
+                                iNewline,
+                                showOutput lastState,
                                 iNewline,
                                 showStats lastState
                             ]
@@ -476,8 +508,15 @@ showInstruction (Update n) = (iStr "Update ") `iAppend` (iNum n)
 showInstruction (Slide n)  = (iStr "Slide ")  `iAppend` (iNum n)
 showInstruction (Alloc n)  = (iStr "Alloc ")  `iAppend` (iNum n)
 
-showInstruction Eval = iStr "Eval"
-showInstruction (Cond _ _) = iStr "Cond"
+showInstruction Eval  = iStr "Eval"
+showInstruction Print = iStr "Print"
+
+showInstruction (Pack tag arity) = iConcat [ iStr "Pack{",
+                                             iNum tag, iStr ", ",
+                                             iNum arity, iStr "}" ]
+
+showInstruction (CaseJump _)  = iStr "CaseJump"
+showInstruction (Split n)     = iStr "Split " `iAppend` iNum n
 
 showInstruction Add  = iStr "Add"
 showInstruction Sub  = iStr "Sub"
@@ -537,6 +576,10 @@ showNode s a (NGlobal _ _) = iConcat [ iStr "Global ", iStr v ]
 showNode _ _ (NAp a1 a2) = iConcat [ iStr "Ap ", showFWAddr a1,
                                      iStr " ",   showFWAddr a2 ]
 
+showNode _ _ (NConstr tag dta) = iConcat [ iStr "NConstr ", iNum tag, iStr " [",
+                                           iIndent $ iInterleave (iStr ",\n") (map showFWAddr dta),
+                                           iStr "]" ]
+
 showDump :: GmState -> Iseq
 showDump s = iConcat [ iStr " Dump: [",
                        iIndent (iInterleave iNewline dumpItems),
@@ -574,6 +617,10 @@ shortShowStack stack = iConcat [ iStr "[",
 showEnv :: GmGlobals -> Iseq
 showEnv = iInterleave iNewline . map formatter
     where formatter (name, addr) = iConcat [ iStr name, iStr " -> ", showFWAddr addr ]
+
+showOutput :: GmState -> Iseq
+showOutput s = iConcat [ iStr "Output: ",
+                          iInterleave (iStr ", ") (reverse $ map iNum (gmOutput s)) ]
 
 showStats :: GmState -> Iseq
 showStats s = iConcat [ iStr "Steps taken = ", iNum (statGetSteps (gmStats s)) ]
