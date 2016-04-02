@@ -45,6 +45,20 @@ extraPreludeDefs = parseDefs [
         "not x = if x False True"
     ]
 
+casePreludeDefs :: CoreProgram
+casePreludeDefs = parseDefs [
+        "if cond t f = case cond of\n\
+        \                   <1> -> f;\n\
+        \                   <2> -> t",
+
+        "caseList l cn cc = case l of\n\
+        \                        <1>       -> cn;\n\
+        \                        <2> hd tl -> cc hd tl",
+
+        "casePair p fn = case p of\n\
+        \                     <1> fst snd -> fn fst snd"
+    ]
+
 lambdaPreludeDefs :: CoreProgram
 lambdaPreludeDefs = parseDefs [
         "caseList = I",

@@ -1,0 +1,4 @@
+add3 a b c = a + b + c;
+add2 = add3 0;
+
+main = add 1 2

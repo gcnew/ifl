@@ -9,7 +9,7 @@ import Heap
 import Iseq
 import Utils
 import Parser (parse)
-import Main (preludeDefs)
+import Main (preludeDefs, extraPreludeDefs, casePreludeDefs)
 
 type GmStats = Int
 type GmStack = [Addr]
@@ -224,7 +224,7 @@ primPrint state = state { gmStack = rest, gmOutput = out : gmOutput state }
 
 pack :: Int -> Int -> GmState -> GmState
 pack tag arity state
-    | length stack /= arity = error "NConstr: not enough arguments"
+    | length parts /= arity = error "NConstr: not enough arguments"
     | otherwise             = state { gmStack = addr : rest, gmHeap = heap' }
 
     where stack = gmStack state
@@ -233,10 +233,9 @@ pack tag arity state
 
           (heap', addr) = hAlloc (gmHeap state) (NConstr tag parts)
 
-
 caseJump :: [(Int, GmCode)] -> GmState -> GmState
-caseJump jumpLocs state = state { gmCode = code' ++ gmCode state, gmStack = rest }
-    where (addr:rest) = gmStack state
+caseJump jumpLocs state = state { gmCode = code' ++ gmCode state }
+    where (addr:_) = gmStack state
           node = hLookup (gmHeap state) addr
 
           code' | (NConstr tag _) <- node
@@ -290,7 +289,7 @@ rearrange n heap stack = take n (map getArg (tail stack)) ++ drop n stack
 
 compile :: CoreProgram -> GmState
 compile program = GmState initialCode [] [] heap globals [] statInitial
-    where scDefs = program ++ preludeDefs
+    where scDefs = program ++ preludeDefs ++ extraPreludeDefs ++ casePreludeDefs
           (heap, globals) = buildInitialHeap scDefs
 
 initialCode :: GmCode
@@ -323,10 +322,14 @@ compileC (EVar v) env
 
 compileC (ENum n) _      = [PushInt n]
 
-compileC (EAp e1 e2) env = compileC e2 env ++ compileC e1 (argOffset 1 env) ++ [ MkAp ]
+compileC (EAp e1 e2) env
+    | (EConstr tag arity) <- e1 = compileC e2 env ++ [Pack tag arity]
+    | otherwise                 = compileC e2 env ++ compileC e1 (argOffset 1 env) ++ [MkAp]
+
 compileC (ELet rec defs expr) env = compileLet compileC rec defs expr env
 
-compileC (EConstr _ _) _ = error "compileC: EConstr: not yet implemented"
+compileC (EConstr tag arity) _ = [Pack tag arity]
+
 compileC (ECase _ _) _   = error "compileC: ECase: not yet implemented"
 compileC (ELam _ _) _    = error "compileC: ELam: not yet implemented"
 
@@ -334,9 +337,15 @@ compileE :: GmCompiler
 compileE (ENum n) _               = [PushInt n]
 compileE (ELet rec defs expr) env = compileLet compileE rec defs expr env
 
--- Lambda If is broken now.. will be fixed when Data constructors are
--- implemented and primitive Cond removed
+compileE (ECase expr alts) env    = compileE expr env ++ [CaseJump (map compileA alts)]
+    where compileA (tag, vars, body) = let n    = length vars
+                                           env' = zip vars [0..] ++ argOffset n env
+                                        in (tag, Split n : compileE body env' ++ [Slide n])
+
 compileE node env
+    -- | (EConstr tag arity : aps) <- unfold node []
+    --    = snd $ foldl' (comp compileC) (0, [Pack tag arity]) aps
+
     | (EVar op : aps)        <- unfold node [],
       Just (_, arity, instr) <- findBuiltIn op,        -- it is a built-in
       False                  <- elem op (aDomain env)  -- and not a local variable
@@ -441,10 +450,8 @@ buildIns = [ ("negate", 1, [Neg]),
 
 compiledPrimitives :: [GmCompiledSC]
 compiledPrimitives = map builtInCC buildIns ++ [
-        ("True", 0, [ PushInt 1, Update 0, Pop 0, Unwind ]),
-        ("False", 0, [ PushInt 0, Update 0, Pop 0, Unwind ]),
-
-        ("abort", 0, [ Abort ])
+        ("abort", 0, [ Abort ]),
+        ("print", 1, [ Eval, Update 0, Push 0, Print, Unwind ])
     ]
 
 builtInCC :: (Name, Int, GmCode) -> GmCompiledSC
