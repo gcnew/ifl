@@ -34,6 +34,9 @@ aLookup [] _ def = def
 aLookup ((k', v) : rest) k def | k' == k   = v
                                | otherwise = aLookup rest k def
 
+aHasKey :: (Eq a) => a -> ASSOC a b -> Bool
+aHasKey key assoc = elem key (aDomain assoc)
+
 aDomain :: ASSOC a b -> [a]
 aDomain alist = [key | (key, _) <- alist]
 

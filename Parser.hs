@@ -154,12 +154,15 @@ pLambda :: Parser CoreExpr
 pLambda = pThen4 mkLambda (pLit "\\") (pOneOrMore pVar) (pLit ".") pExpr
     where mkLambda _ vars _ expr = ELam vars expr
 
+pPack :: Parser CoreExpr
+pPack = pThen4 (\_ _ x _ -> x) (pLit "Pack") (pLit "{") pTagArity (pLit "}")
+    where pTagArity = pThen3 (\tag _ arity -> EConstr tag arity) pNum (pLit ",") pNum
+
 pAExpr :: Parser CoreExpr
 pAExpr = (pVar `pApply` EVar)
   `pAlt` (pNum `pApply` ENum)
-  `pAlt` (pThen4 (\_ _ x _ -> x) (pLit "Pack") (pLit "{") pTagArity (pLit "}"))
+  `pAlt` pPack
   `pAlt` (pThen3 (\_ x _ -> x) (pLit "(") pExpr (pLit ")"))
-  where pTagArity = pThen3 (\tag _ arity -> EConstr tag arity) pNum (pLit ",") pNum
 
 parse :: String -> CoreProgram
 parse = syntax . (clex 1)

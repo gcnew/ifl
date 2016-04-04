@@ -2,13 +2,17 @@
 
 module GM where
 
-import Data.List (find, foldl')
+import Control.Monad (foldM)
+import Control.Monad.Trans.State hiding (state)
+
+import Data.List (find, isPrefixOf)
 
 import AST
 import Heap
 import Iseq
 import Utils
-import Parser (parse)
+import Lexer (clex)
+import Parser (parse, pPack)
 import Main (preludeDefs, extraPreludeDefs, casePreludeDefs)
 
 type GmStats = Int
@@ -23,7 +27,7 @@ type GmDumpItem = (GmCode, GmStack)
 
 type GmEnvironment = ASSOC Name Int
 type GmCompiledSC = (Name, Int, GmCode)
-type GmCompiler = CoreExpr -> GmEnvironment -> GmCode
+type GmCompiler = CoreExpr -> GmEnvironment -> State GmGlobals GmCode
 
 data Node = NNum Int            -- Numbers
           | NAp Addr Addr       -- Applications
@@ -298,94 +302,161 @@ initialCode = [ PushGlobal "main", Unwind ] -- no idea why we need Eval,
 
 buildInitialHeap :: CoreProgram -> (GmHeap, GmGlobals)
 buildInitialHeap prog = mapAccuml allocateSc hInitial compiled
-    where compiled = map compileSc prog ++ compiledPrimitives
+    where globalsMap = foldr (\(name, _, _) acc -> (name, hNull) : acc) [] prog
+          (cSc, globalsMap') = runState (mapM compileSc prog) globalsMap
+          synth = filter (isPrefixOf "$") (map fst globalsMap')
+          cSynth = map compileS synth
+          compiled = cSc ++ cSynth ++ compiledPrimitives
 
 allocateSc :: GmHeap -> GmCompiledSC -> (GmHeap, (Name, Addr))
 allocateSc heap (name, nargs, instns) = (heap', (name, addr))
     where (heap', addr) = hAlloc heap (NGlobal nargs instns)
 
-compileSc :: (Name, [Name], CoreExpr) -> GmCompiledSC
-compileSc (name, env, body) = (name, length env, compileR body (zip env [0..]))
+compileSc :: (Name, [Name], CoreExpr) -> State GmGlobals GmCompiledSC
+compileSc (name, env, body) = do code <- compileR body (zip env [0..])
+                                 return (name, length env, code)
 
 compileR :: GmCompiler
-compileR e env = compileE e env ++ [ Update n, Pop n, Unwind ]
+compileR e env = do code <- compileE e env
+                    return $ code ++ [ Update n, Pop n, Unwind ]
     where n = length env
 
 argOffset :: Int -> GmEnvironment -> GmEnvironment
 argOffset n env = [(v, n+m) | (v,m) <- env]
 
+compileS :: String -> GmCompiledSC
+compileS name = (name, arity, [ Pack tag arity, Update 0, Unwind ])
+    where (EConstr tag arity) = fst . head . pPack . clex 1 $ tail name
+
 compileC :: GmCompiler
 compileC (EVar v) env
-    | elem v (aDomain env) = [Push n]
-    | otherwise            = [PushGlobal v]
+    | aHasKey v env = return [Push n]
+    | otherwise     = return [PushGlobal v]
     where n = aLookup env v (error "Can’t happen")
 
-compileC (ENum n) _      = [PushInt n]
+compileC (ENum n) _      = return [PushInt n]
 
-compileC (EAp e1 e2) env
-    | (EConstr tag arity) <- e1 = compileC e2 env ++ [Pack tag arity]
-    | otherwise                 = compileC e2 env ++ compileC e1 (argOffset 1 env) ++ [MkAp]
+compileC node@(EAp _ _) env
+    -- saturated ctor
+    | (EConstr tag arity : aps) <- spine,
+      n - 1 == arity
+        = do (_, code) <- foldM (compileAp env compileC) (n - 2, []) aps
+             return $ code ++ [Pack tag arity]
+
+    -- not-saturated ctor
+    | (EConstr tag arity : aps) <- spine,
+      n - 1 /= arity
+        = do ctorName <- getCtorName tag arity
+             (_, code) <- foldM (compileAp env compileC) (n - 2, []) aps
+             return $ code ++ (PushGlobal ctorName : replicate (n - 1) MkAp)
+
+    | otherwise
+        = do (_, code) <- foldM (compileAp env compileC) (n - 1, []) spine
+             return $ code ++ replicate (n - 1) MkAp
+
+    where spine = unfoldAp node
+          n     = length spine
+
 
 compileC (ELet rec defs expr) env = compileLet compileC rec defs expr env
 
-compileC (EConstr tag arity) _ = [Pack tag arity]
+compileC (EConstr tag arity) _
+    | arity == 0 = return [Pack tag arity]
+    | otherwise  = do ctorName <- getCtorName tag arity
+                      return [PushGlobal ctorName]
 
 compileC (ECase _ _) _   = error "compileC: ECase: not yet implemented"
 compileC (ELam _ _) _    = error "compileC: ELam: not yet implemented"
 
 compileE :: GmCompiler
-compileE (ENum n) _               = [PushInt n]
+compileE (ENum n) _               = return [PushInt n]
 compileE (ELet rec defs expr) env = compileLet compileE rec defs expr env
 
-compileE (ECase expr alts) env    = compileE expr env ++ [CaseJump (map compileA alts)]
-    where compileA (tag, vars, body) = let n    = length vars
-                                           env' = zip vars [0..] ++ argOffset n env
-                                        in (tag, Split n : compileE body env' ++ [Slide n])
+compileE (ECase expr alts) env    = do cExpr <- compileE expr env
+                                       cAlts <- mapM compileA alts
 
-compileE node env
-    -- | (EConstr tag arity : aps) <- unfold node []
-    --    = snd $ foldl' (comp compileC) (0, [Pack tag arity]) aps
+                                       return $ cExpr ++ [CaseJump cAlts]
 
-    | (EVar op : aps)        <- unfold node [],
-      Just (_, arity, instr) <- findBuiltIn op,        -- it is a built-in
-      False                  <- elem op (aDomain env)  -- and not a local variable
-        = let strictAps = take arity aps
-              lazyAps   = drop arity aps
-              strictRes = foldl' (comp compileE) (length aps - 1, instr) strictAps
-              (_, code) = foldl' (comp compileC) strictRes lazyAps
-           in code ++ replicate (length lazyAps) MkAp -- operator MkAp nodes are needed only in
-                                                      -- lambda prelude
-                                                      -- e.g.: (1 > 0) 5 6
+    where compileA (tag, vars, body) = do let n    = length vars
+                                              env' = zip vars [0..] ++ argOffset n env
 
-    | otherwise = compileC node env ++ [ Eval ]
+                                          cBody <- compileE body env'
+                                          return (tag, Split n : cBody ++ [Slide n])
 
+compileE expr env
+    = do globals <- get
+         case () of
+          _ | (EVar op : aps)        <- unfoldAp expr,
+              Just (_, arity, instr) <- findBuiltIn op,  -- it is a built-in
+              not (aHasKey op env),                      -- and not a local variable
+              not (aHasKey op globals)                   -- and not a global variable
+
+                -> do let strictAps = take arity aps
+                          lazyAps   = drop arity aps
+
+                      strictRes <- foldM (compileAp env compileE) (length aps - 1, instr) strictAps
+                      (_, code) <- foldM (compileAp env compileC) strictRes lazyAps
+
+                      return (code ++ replicate (length lazyAps) MkAp)
+
+            | otherwise
+                -> do cExpr <- compileC expr env
+                      return (cExpr ++ [ Eval ])
+
+compileAp :: GmEnvironment
+             -> GmCompiler
+             -> (Int, GmCode)
+             -> CoreExpr
+             -> State GmGlobals (Int, GmCode)
+compileAp env cc (offset, code) expr = do cExpr <- cc expr env'
+                                          return (offset - 1, cExpr ++ code)
+    where env' = argOffset offset env
+
+findBuiltIn :: String -> Maybe (Name, Int, GmCode)
+findBuiltIn op = find (\(name, _, _) -> name == op) buildIns
+
+unfoldAp :: CoreExpr -> [CoreExpr]
+unfoldAp expr = unfold expr []
     where unfold (EAp e1 e2) acc = unfold e1 (e2 : acc)
           unfold n acc           = n : acc
 
-          findBuiltIn op = find (\(name, _, _) -> name == op) buildIns
+getCtorName :: Int -> Int -> State GmGlobals String
+getCtorName tag arity = do globals <- get
 
-          comp cc (offset, code) expr = let env' = argOffset offset env
-                                         in (offset - 1, cc expr env' ++ code)
+                           if aHasKey name globals
+                              then return ()
+                              else put ((name, hNull) : globals)
+
+                           return name
+
+    where name = "$Pack{" ++ show tag ++ "," ++ show arity ++ "}"
 
 compileLet :: GmCompiler -> Bool -> [(Name, CoreExpr)] -> GmCompiler
 compileLet compiler rec defs expr env
-    | rec       = [ Alloc n ]
-                    ++ compileDefs True defs env'
-                    ++ replicate n (Update $ n - 1)
-                    ++ compiler expr env'
-                    ++ [ Slide n ]
+    | rec       = do cDefs <- compileDefs True defs env'
+                     cExpr <- compiler expr env'
 
-    | otherwise = compileDefs False defs env
-                    ++ compiler expr env'
-                    ++ [ Slide n ]
+                     return $ [ Alloc n ]
+                                ++ cDefs
+                                ++ replicate n (Update $ n - 1)
+                                ++ cExpr
+                                ++ [ Slide n ]
+
+    | otherwise = do cDefs <- compileDefs False defs env
+                     cExpr <- compiler expr env'
+
+                     return $ cDefs ++ cExpr ++ [ Slide n ]
 
     where n    = length defs
           env' = zip (map fst defs) [n-1, n-2 .. 0] ++ argOffset n env
 
-compileDefs :: Bool -> [(Name, CoreExpr)] -> GmEnvironment -> GmCode
-compileDefs _ [] _ = []
+compileDefs :: Bool -> [(Name, CoreExpr)] -> GmEnvironment -> State GmGlobals GmCode
+compileDefs _ [] _ = return []
 
-compileDefs rec ((name, expr):defs) env = compileC expr env ++ compileDefs rec defs env'
+compileDefs rec ((name, expr):defs) env = do cExpr <- compileC expr env
+                                             cDefs <- compileDefs rec defs env'
+
+                                             return $ cExpr ++ cDefs
     where env' | rec       = env
                | otherwise = (name, 0) : argOffset 1 env
 
@@ -451,7 +522,9 @@ buildIns = [ ("negate", 1, [Neg]),
 compiledPrimitives :: [GmCompiledSC]
 compiledPrimitives = map builtInCC buildIns ++ [
         ("abort", 0, [ Abort ]),
-        ("print", 1, [ Eval, Update 0, Push 0, Print, Unwind ])
+        ("print", 2, [ Eval, Print, Update 0, Unwind ])
+        -- naive:
+        -- ("print", 2, [ Push 0, Eval, Print, Push 1, Update 2, Pop 2, Unwind ])
     ]
 
 builtInCC :: (Name, Int, GmCode) -> GmCompiledSC
@@ -476,7 +549,7 @@ showResults opts states = iDisplay $ iConcat [
           nl2 = iNewline `iAppend` iNewline
 
           scDefOutp | ssSCCode opts   = iInterleave iNewline [
-                                            iStr "Supercombinator definitions",
+                                            iStr "Supercombinator definitions:\n",
                                             iInterleave nl2 (map (showSC s) (gmGlobals s)),
                                             iNewline
                                         ]
