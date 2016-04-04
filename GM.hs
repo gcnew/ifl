@@ -457,7 +457,7 @@ compileDefs rec ((name, expr):defs) env = do cExpr <- compileC expr env
                                              cDefs <- compileDefs rec defs env'
 
                                              return $ cExpr ++ cDefs
-    where env' | rec       = env
+    where env' | rec       = argOffset 1 env
                | otherwise = (name, 0) : argOffset 1 env
 
 boxInteger :: Int -> GmState -> GmState
