@@ -1,8 +1,10 @@
 {-# OPTIONS_GHC -Wall #-}
+{-# LANGUAGE MultiWayIf #-}
 
 module GM where
 
-import Control.Monad (foldM)
+import Control.Monad (guard, foldM)
+import Control.Monad.Identity (runIdentity)
 import Control.Monad.Trans.State hiding (state)
 
 import Data.List (find, isPrefixOf)
@@ -24,7 +26,7 @@ type GmDump = [GmDumpItem]
 type GmCode = [Instruction]
 type GmGlobals = ASSOC Name Addr
 
-type GmDumpItem = (GmCode, GmStack)
+type GmDumpItem = (GmCode, GmStack, GmVStack)
 
 type GmEnvironment = ASSOC Name Int
 type GmCompiledSC = (Name, Int, GmCode)
@@ -138,12 +140,12 @@ step state = dispatch i (state { gmCode = is })
           dispatch Get = primGet
           dispatch (Cond ifTrue ifFalse) = primCond ifTrue ifFalse
 
-          dispatch Neg = aritmetic1 negate
+          dispatch Neg = primitive1 negate
 
-          dispatch Add = aritmetic2 (+)
-          dispatch Sub = aritmetic2 (-)
-          dispatch Mul = aritmetic2 (*)
-          dispatch Div = aritmetic2 div
+          dispatch Add = primitive2 (+)
+          dispatch Sub = primitive2 (-)
+          dispatch Mul = primitive2 (*)
+          dispatch Div = primitive2 div
 
           dispatch Eq = comparison (==)
           dispatch Ne = comparison (/=)
@@ -221,12 +223,14 @@ isDataNode _             = False
 forceEval :: GmState -> GmState
 forceEval state
     | isDataNode node = state
-    | otherwise       = state { gmCode  = [ Unwind ],
-                                gmStack = [ addr ],
-                                gmDump  = (code, rest) : dump }
-    where stack = gmStack state
-          code  = gmCode state
-          dump  = gmDump state
+    | otherwise       = state { gmCode   = [ Unwind ],
+                                gmStack  = [ addr ],
+                                gmVStack = [],
+                                gmDump   = (code, rest, vStack) : dump }
+    where stack  = gmStack state
+          vStack = gmVStack state
+          code   = gmCode state
+          dump   = gmDump state
 
           (addr:rest) = stack
           node        = hLookup (gmHeap state) addr
@@ -312,8 +316,11 @@ unwind state = newState (hLookup heap addr)
           (addr:rest) = stack
 
           unwindData
-            | ((code, stack') : dump') <- dump
-                = state { gmCode = code, gmStack = addr : stack', gmDump = dump' }
+            | ((code, stack', vStack') : dump') <- dump
+                = state { gmCode = code,
+                          gmStack = addr : stack',
+                          gmVStack = vStack',
+                          gmDump = dump' }
             | otherwise = state
 
           newState (NNum _)      = unwindData
@@ -324,9 +331,10 @@ unwind state = newState (hLookup heap addr)
 
           newState (NGlobal n code)
             | nArgs < n = case dump of
-                ((code', stack') : dump') -> state { gmCode = code',
-                                                     gmStack = last stack : stack',
-                                                     gmDump = dump' }
+                ((code', stack', vStack') : dump') -> state { gmCode = code',
+                                                              gmStack = last stack : stack',
+                                                              gmVStack = vStack',
+                                                              gmDump = dump' }
 
                 _                         -> error "Unwinding with too few arguments"
 
@@ -351,9 +359,10 @@ buildInitialHeap :: CoreProgram -> (GmHeap, GmGlobals)
 buildInitialHeap prog = mapAccuml allocateSc hInitial compiled
     where globalsMap = foldr (\(name, _, _) acc -> (name, hNull) : acc) [] prog
           (cSc, globalsMap') = runState (mapM compileSc prog) globalsMap
+          (cExtra, []) = runState (mapM compileSc builtInSc) []
           synth = filter (isPrefixOf "$") (map fst globalsMap')
           cSynth = map compileS synth
-          compiled = cSc ++ cSynth ++ compiledPrimitives
+          compiled = cSc ++ cExtra ++ cSynth ++ compiledPrimitives
 
 allocateSc :: GmHeap -> GmCompiledSC -> (GmHeap, (Name, Addr))
 allocateSc heap (name, nargs, instns) = (heap', (name, addr))
@@ -387,18 +396,18 @@ compileC node@(EAp _ _) env
     -- saturated ctor
     | (EConstr tag arity : aps) <- spine,
       n - 1 == arity
-        = do (_, code) <- foldM (compileAp env compileC) (n - 2, []) aps
+        = do (_, code) <- foldM (ccLazy env) (n - 2, []) aps
              return $ code ++ [Pack tag arity]
 
     -- not-saturated ctor
     | (EConstr tag arity : aps) <- spine,
       n - 1 /= arity
         = do ctorName <- getCtorName tag arity
-             (_, code) <- foldM (compileAp env compileC) (n - 2, []) aps
+             (_, code) <- foldM (ccLazy env) (n - 2, []) aps
              return $ code ++ (PushGlobal ctorName : replicate (n - 1) MkAp)
 
     | otherwise
-        = do (_, code) <- foldM (compileAp env compileC) (n - 1, []) spine
+        = do (_, code) <- foldM (ccLazy env) (n - 1, []) spine
              return $ code ++ replicate (n - 1) MkAp
 
     where spine = unfoldAp node
@@ -432,35 +441,75 @@ compileE (ECase expr alts) env    = do cExpr <- compileE expr env
 
 compileE expr env
     = do globals <- get
-         case () of
-          _ | (EVar op : aps)        <- unfoldAp expr,
-              Just (_, arity, instr) <- findBuiltIn op,  -- it is a built-in
-              not (aHasKey op env),                      -- and not a local variable
-              not (aHasKey op globals)                   -- and not a global variable
+         let mRes = runStateT (compileIfOrOp boxResult expr env) globals
 
-                -> do let strictAps = take arity aps
-                          lazyAps   = drop arity aps
+         if | Just res <- mRes -> StateT $ const (return res)
+            | otherwise        -> do cExpr <- compileC expr env
+                                     return (cExpr ++ [ Eval ])
 
-                      strictRes <- foldM (compileAp env compileE) (length aps - 1, instr) strictAps
-                      (_, code) <- foldM (compileAp env compileC) strictRes lazyAps
+compileIfOrOp :: (String -> GmCode)                -- epilogue provider
+                 -> CoreExpr                       -- the root expression
+                 -> GmEnvironment                  -- the environment
+                 -> StateT GmGlobals Maybe GmCode  -- the result
+compileIfOrOp getEpilogue expr env
+    = do globals <- get
 
-                      return (code ++ replicate (length lazyAps) MkAp)
+         let spine = unfoldAp expr
+         (EVar op:aps) <- return $ spine
 
-            | otherwise
-                -> do cExpr <- compileC expr env
-                      return (cExpr ++ [ Eval ])
+         guard $ not (aHasKey op env)      -- not a local variable
+         guard $ not (aHasKey op globals)  -- not a global variable
 
-compileAp :: GmEnvironment
-             -> GmCompiler
-             -> (Int, GmCode)
-             -> CoreExpr
-             -> State GmGlobals (Int, GmCode)
-compileAp env cc (offset, code) expr = do cExpr <- cc expr env'
-                                          return (offset - 1, cExpr ++ code)
+         mapStateT (return . runIdentity) $
+             if | op == "if" -> compileIf aps env
+
+                | (Just opInfo) <- findBuiltIn op
+                    -> compileOp getEpilogue opInfo aps env
+
+                | otherwise  -> return Nothing
+
+compileOp :: (String -> GmCode)
+             -> (Name, Int, GmCode)
+             -> [CoreExpr]
+             -> GmEnvironment
+             -> State GmGlobals GmCode
+compileOp getEpilogue (op, arity, instr) aps env
+    = do let strictAps    = take arity aps
+             lazyAps      = drop arity aps
+             lazyApsCount = length lazyAps
+             epilogue     = instr ++ getEpilogue op
+
+         strictCode <- foldM (ccStrict env) epilogue strictAps
+         (_, code)  <- foldM (ccLazy env) (lazyApsCount, strictCode) lazyAps
+
+         return $ code ++ replicate lazyApsCount MkAp
+
+compileIf :: [CoreExpr] -> GmEnvironment -> State GmGlobals GmCode
+compileIf = undefined
+
+ccStrict :: GmEnvironment -> GmCode -> CoreExpr -> State GmGlobals GmCode
+ccStrict env code expr = do cExpr <- compileB expr env
+                            return $ cExpr ++ code
+
+ccLazy :: GmEnvironment -> (Int, GmCode) -> CoreExpr -> State GmGlobals (Int, GmCode)
+ccLazy env (offset, code) expr = do cExpr <- compileC expr env'
+                                    return (offset - 1, cExpr ++ code)
     where env' = argOffset offset env
 
-findBuiltIn :: String -> Maybe (Name, Int, GmCode)
-findBuiltIn op = find (\(name, _, _) -> name == op) buildIns
+compileB :: GmCompiler
+compileB (ENum n) _ = return [PushBasic n]
+compileB (ELet rec defs expr) env = compileLet compileB rec defs expr env
+
+compileB expr env
+    = do globals <- get
+         case () of
+          _ | (Just res) <- runStateT (compileIfOrOp (const []) expr env) globals
+                -> StateT $ const (return res)
+
+            | otherwise
+                -> do cExpr <- compileE expr env
+                      return (cExpr ++ [ Get ])
+
 
 unfoldAp :: CoreExpr -> [CoreExpr]
 unfoldAp expr = unfold expr []
@@ -507,77 +556,67 @@ compileDefs rec ((name, expr):defs) env = do cExpr <- compileC expr env
     where env' | rec       = argOffset 1 env
                | otherwise = (name, 0) : argOffset 1 env
 
-boxInteger :: Int -> GmState -> GmState
-boxInteger n state = state { gmStack = addr : gmStack state, gmHeap = heap' }
-    where (heap', addr) = hAlloc (gmHeap state) (NNum n)
+primitive1 :: (Int -> Int)           -- operator
+              -> GmState -> GmState  -- in state & retval
+primitive1 op state =  state { gmVStack = op val : vStack' }
+    where (val:vStack') = gmVStack state
 
-unboxInteger :: Addr -> GmState -> Int
-unboxInteger addr state = case hLookup (gmHeap state) addr of
-        (NNum n) -> n
-        _        -> error "Unboxing a non-integer"
+primitive2 :: (Int -> Int -> Int)    -- operator
+              -> GmState -> GmState  -- in state & retval
+primitive2 op state = state { gmVStack = v1 `op` v2 : vStack' }
+    where (v1:v2:vStack') = gmVStack state
 
-boxBoolean :: Bool -> GmState -> GmState
-boxBoolean b state = state { gmStack = addr : gmStack state, gmHeap = heap' }
-    where (heap', addr) = hAlloc (gmHeap state) (findPrimDef key)
+comparison :: (Int -> Int -> Bool)   -- operator
+              -> GmState -> GmState  -- in state & retval
+comparison op = primitive2 liftedOp
+    where liftedOp x y | x `op` y  = 2 -- True
+                       | otherwise = 1 -- False
 
-          findPrimDef prim = NInd (aLookup (gmGlobals state) prim err)
-              where err = error $ "Primitive definition `" ++ prim ++ "` not found!"
-
-          key | b         = "True"
-              | otherwise = "False"
-
-unboxBoolean :: Addr -> GmState -> Bool
-unboxBoolean addr state = case hLookup (gmHeap state) addr of
-        (NNum 1) -> True
-        (NNum 0) -> False
-        _        -> error "Unboxing a non-boolean"
-
-primitive1 :: (a -> GmState -> GmState)  -- boxing function
-              -> (Addr -> GmState -> b)  -- unboxing function
-              -> (b -> a)                -- operator
-              -> GmState -> GmState      -- in state & retval
-primitive1 box unbox op state = box (op (unbox addr state)) (state { gmStack = stack' })
-    where (addr:stack') = gmStack state
-
-primitive2 :: (a -> GmState -> GmState)  -- boxing function
-              -> (Addr -> GmState -> b)  -- unboxing function
-              -> (b -> b -> a)           -- operator
-              -> GmState -> GmState      -- in state & retval
-primitive2 box unbox op state = box result (state { gmStack = stack' })
-    where (a1:a2:stack') = gmStack state
-          result         = unbox a1 state `op` unbox a2 state
-
-aritmetic1 :: (Int -> Int) -> GmState -> GmState
-aritmetic1 = primitive1 boxInteger unboxInteger
-
-aritmetic2 :: (Int -> Int -> Int) -> GmState -> GmState
-aritmetic2 = primitive2 boxInteger unboxInteger
-
-comparison :: (Int -> Int -> Bool) -> GmState -> GmState
-comparison = primitive2 boxBoolean unboxInteger
-
-buildIns :: [(Name, Int, GmCode)]  -- (name, arity, instruction)
-buildIns = [ ("negate", 1, [Neg]),
+arithIns :: [(Name, Int, GmCode)]  -- (name, arity, instruction)
+arithIns = [ ("negate", 1, [Neg]),
 
              ("+", 2, [Add]), ("-", 2, [Sub]),
-             ("*", 2, [Mul]), ("/", 2, [Div]),
+             ("*", 2, [Mul]), ("/", 2, [Div]) ]
 
-             ( ">", 2, [Gt, Eval]), (">=", 2, [Ge, Eval]),
-             ( "<", 2, [Lt, Eval]), ("<=", 2, [Le, Eval]),
-             ("==", 2, [Eq, Eval]), ("/=", 2, [Ne, Eval]) ]
+relationIns :: [(Name, Int, GmCode)]  -- (name, arity, instruction)
+relationIns = [ ( ">", 2, [Gt]), (">=", 2, [Ge]),
+                ( "<", 2, [Lt]), ("<=", 2, [Le]),
+                ("==", 2, [Eq]), ("/=", 2, [Ne]) ]
+
+
+builtIns :: [(Name, Int, GmCode)]
+builtIns = arithIns ++ relationIns
+
+builtInSc :: CoreProgram
+builtInSc = map cc builtIns
+    where cc (name, arity, _) = let args = map genArg [1..arity]
+                                 in (name, args, foldl1 EAp (map EVar (name:args)))
+          genArg n = "a" ++ show n
 
 compiledPrimitives :: [GmCompiledSC]
-compiledPrimitives = map builtInCC buildIns ++ [
+compiledPrimitives = [
         ("abort", 0, [ Abort ]),
         ("print", 2, [ Eval, Print, Update 0, Unwind ])
         -- naive:
         -- ("print", 2, [ Push 0, Eval, Print, Push 1, Update 2, Pop 2, Unwind ])
     ]
 
-builtInCC :: (Name, Int, GmCode) -> GmCompiledSC
-builtInCC (name, arity, ins) = (name, arity, force ++ ins ++ clean)
-    where force = concat $ replicate arity [ Push (arity - 1), Eval ]
-          clean = [ Update arity, Pop arity, Unwind ]
+pluckName :: (Name, Int, GmCode) -> Name
+pluckName (name, _, _) = name
+
+findBuiltIn :: String -> Maybe (Name, Int, GmCode)
+findBuiltIn = \op -> find ((== op) . pluckName) builtIns
+
+isRelation :: String -> Bool
+isRelation op = op `elem` map pluckName relationIns
+
+isArith :: String -> Bool
+isArith op = op `elem` map pluckName arithIns
+
+boxResult :: String -> GmCode
+boxResult op | isRelation op = [MkBool]
+             | isArith    op = [MkInt]
+             | otherwise     = error $ "boxResult: Unexpected operator: " ++ op
 
 showResults :: ShowStateOptions -> [GmState] -> String
 showResults opts states = iDisplay $ iConcat [
@@ -642,7 +681,7 @@ showInstruction Get           = iStr "Get"
 showInstruction (Cond _ _)    = iStr "Cond"
 showInstruction MkInt         = iStr "MkInt"
 showInstruction MkBool        = iStr "MkBool"
-showInstruction (PushBasic n) = iStr "PushBasic" `iAppend` iNum n
+showInstruction (PushBasic n) = iStr "PushBasic " `iAppend` iNum n
 
 showInstruction (Pack tag arity) = iConcat [ iStr "Pack{",
                                              iNum tag, iStr ", ",
@@ -727,10 +766,12 @@ showDump s = iConcat [ iStr " Dump: [",
     where dumpItems = map showDumpItem (reverse (gmDump s))
 
 showDumpItem :: GmDumpItem -> Iseq
-showDumpItem (code, stack) = iConcat [ iStr "<",
-                                       shortShowInstructions 3 code,
-                                       iStr ", ",
-                                       shortShowStack stack, iStr ">" ]
+showDumpItem (code, stack, vStack) = iInterleave iNewline [
+        iStr "<",
+        shortShowInstructions 3 code,
+        shortShowStack stack,
+        shortShowVStack vStack,
+        iStr ">" ]
 
 shortShowInstructions :: Int -> GmCode -> Iseq
 shortShowInstructions n code = iConcat [ iStr "{",
@@ -740,6 +781,14 @@ shortShowInstructions n code = iConcat [ iStr "{",
           dotcodes | length code > n = codes ++ [ iStr "..." ]
                    | otherwise = codes
 
+shortShowStack :: GmStack -> Iseq
+shortShowStack stack = iConcat [ iStr "[",
+                                 iInterleave (iStr ", ") (map showFWAddr stack),
+                                 iStr "]" ]
+
+shortShowVStack :: GmVStack -> Iseq
+shortShowVStack = iInterleave (iStr ", ") . map iNum . take 5 . reverse
+
 showHeap :: GmState -> Iseq
 showHeap state = iInterleave iNewline (map formatter tuples)
     where formatter (addr, node) = iConcat [ showFWAddr addr,
@@ -748,11 +797,6 @@ showHeap state = iInterleave iNewline (map formatter tuples)
 
           heap   = gmHeap state
           tuples =  [ (addr, hLookup heap addr) | addr <- hAddresses heap ]
-
-shortShowStack :: GmStack -> Iseq
-shortShowStack stack = iConcat [ iStr "[",
-                                 iInterleave (iStr ", ") (map showFWAddr stack),
-                                 iStr "]" ]
 
 showEnv :: GmGlobals -> Iseq
 showEnv = iInterleave iNewline . map formatter
