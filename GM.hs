@@ -17,6 +17,7 @@ import Main (preludeDefs, extraPreludeDefs, casePreludeDefs)
 
 type GmStats = Int
 type GmStack = [Addr]
+type GmVStack = [Int]
 type GmOutput = [Int]
 type GmHeap = Heap Node
 type GmDump = [GmDumpItem]
@@ -45,6 +46,11 @@ data Instruction = Unwind
                  | Slide Int
                  | Alloc Int
                  | Eval
+                 | PushBasic Int
+                 | MkInt
+                 | MkBool
+                 | Get
+                 | Cond GmCode GmCode
                  | Pack Int Int
                  | CaseJump [(Int, GmCode)]
                  | Split Int
@@ -56,6 +62,7 @@ data Instruction = Unwind
 
 data GmState = GmState { gmCode    :: GmCode,     -- Current instruction stream
                          gmStack   :: GmStack,    -- Current stack
+                         gmVStack  :: GmVStack,
                          gmDump    :: GmDump,     -- Stack of Code/Stack pairs
                          gmHeap    :: GmHeap,     -- Heap of nodes
                          gmGlobals :: GmGlobals,  -- Global addresses in heap
@@ -124,6 +131,12 @@ step state = dispatch i (state { gmCode = is })
           dispatch Print  = primPrint
 
           dispatch Abort  = error "Core: abort"
+
+          dispatch (PushBasic n) = pushBasic n
+          dispatch MkInt = mkInt
+          dispatch MkBool = mkBool
+          dispatch Get = primGet
+          dispatch (Cond ifTrue ifFalse) = primCond ifTrue ifFalse
 
           dispatch Neg = aritmetic1 negate
 
@@ -226,6 +239,40 @@ primPrint state = state { gmStack = rest, gmOutput = out : gmOutput state }
           out | (NNum n) <- node = n
               | otherwise        = error "Print: number expected"
 
+pushBasic :: Int -> GmState -> GmState
+pushBasic n state = state { gmVStack = n : (gmVStack state) }
+
+mkInt :: GmState -> GmState
+mkInt state = state { gmStack = addr : gmStack state, gmVStack = vStack', gmHeap = heap' }
+    where (n:vStack')   = gmVStack state
+          (heap', addr) = hAlloc (gmHeap state) (NNum n)
+
+mkBool :: GmState -> GmState
+mkBool state = state { gmStack = addr : gmStack state, gmVStack = vStack', gmHeap = heap' }
+    where (n:vStack')   = gmVStack state
+
+          node | n == 1    = NConstr 1 []
+               | n == 2    = NConstr 2 []
+               | otherwise = error "mkBool: not a boolean"
+
+          (heap', addr) = hAlloc (gmHeap state) node
+
+primGet :: GmState -> GmState
+primGet state = state { gmStack = stack', gmVStack = n : (gmVStack state) }
+    where (addr:stack') = gmStack state
+          node = hLookup (gmHeap state) addr
+          n | (NNum x)       <- node = x
+            | (NConstr 1 []) <- node = 1 -- False
+            | (NConstr 2 []) <- node = 2 -- True
+            | otherwise              = error "primGet: invalid node"
+
+primCond :: GmCode -> GmCode -> GmState -> GmState
+primCond ifTrue ifFalse state = state { gmCode = code' ++ gmCode state, gmVStack = vStack' }
+    where (n:vStack') = gmVStack state
+          code' | n == 1    = ifFalse
+                | n == 2    = ifTrue
+                | otherwise = error "primCond: not a boolean"
+
 pack :: Int -> Int -> GmState -> GmState
 pack tag arity state
     | length parts /= arity = error "NConstr: not enough arguments"
@@ -292,7 +339,7 @@ rearrange n heap stack = take n (map getArg (tail stack)) ++ drop n stack
                       | otherwise = error "Broken spine: non NAp node encountered"
 
 compile :: CoreProgram -> GmState
-compile program = GmState initialCode [] [] heap globals [] statInitial
+compile program = GmState initialCode [] [] [] heap globals [] statInitial
     where scDefs = program ++ preludeDefs ++ extraPreludeDefs ++ casePreludeDefs
           (heap, globals) = buildInitialHeap scDefs
 
@@ -591,6 +638,12 @@ showInstruction (Alloc n)  = (iStr "Alloc ")  `iAppend` (iNum n)
 showInstruction Eval  = iStr "Eval"
 showInstruction Print = iStr "Print"
 
+showInstruction Get           = iStr "Get"
+showInstruction (Cond _ _)    = iStr "Cond"
+showInstruction MkInt         = iStr "MkInt"
+showInstruction MkBool        = iStr "MkBool"
+showInstruction (PushBasic n) = iStr "PushBasic" `iAppend` iNum n
+
 showInstruction (Pack tag arity) = iConcat [ iStr "Pack{",
                                              iNum tag, iStr ", ",
                                              iNum arity, iStr "}" ]
@@ -617,6 +670,8 @@ showState opts s | null views = iNil
 
     where stackLines = showStack s
 
+          vStackLines = showVStack s
+
           dumpLines = showDump s
 
           codeLines  = showInstructions (gmCode s)
@@ -631,11 +686,16 @@ showState opts s | null views = iNil
                                           envLines,
                                           codeLines,
                                           stackLines,
+                                          vStackLines,
                                           dumpLines ]
 
 showStack :: GmState -> Iseq
 showStack s = iInterleave iNewline stackItems
-    where stackItems = (map (showStackItem s) (reverse (gmStack s)))
+    where stackItems = map (showStackItem s) (reverse (gmStack s))
+
+showVStack :: GmState -> Iseq
+showVStack s = iInterleave iNewline stackItems
+    where stackItems = map iNum (reverse (gmVStack s))
 
 showStackItem :: GmState -> Addr -> Iseq
 showStackItem s a = iConcat [ showFWAddr a,
