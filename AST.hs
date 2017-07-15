@@ -47,3 +47,8 @@ isAtomicExpr :: Expr a -> Bool
 isAtomicExpr (EVar _) = True
 isAtomicExpr (ENum _) = True
 isAtomicExpr _        = False
+
+removeDefinition :: Name -> Program a -> Program a
+removeDefinition name = foldr remove []
+    where remove def@(name', _, _) acc | name == name' = acc
+                                       | otherwise     = def:acc

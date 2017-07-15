@@ -46,6 +46,11 @@ aRange alist = [val | (_, val) <- alist]
 aEmpty :: ASSOC a b
 aEmpty = []
 
+aRemove :: (Eq a) => a -> ASSOC a b -> ASSOC a b
+aRemove _ [] = []
+aRemove k ((k', v) : rest) | k' == k   = rest
+                           | otherwise = (k', v) : aRemove k rest
+
 mapAccuml :: (a -> b -> (a, c)) -> a -> [b] -> (a, [c])
 mapAccuml _ acc [] = (acc, [])
 mapAccuml f acc (x:xs) = (acc2, x':xs')

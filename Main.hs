@@ -47,9 +47,9 @@ extraPreludeDefs = parseDefs [
 
 casePreludeDefs :: CoreProgram
 casePreludeDefs = parseDefs [
-        "if cond t f = case cond of\n\
-        \        <1> -> f;\n\
-        \        <2> -> t",
+        -- "if cond t f = case cond of\n\
+        -- \        <1> -> f;\n\
+        -- \        <2> -> t",
 
         "caseList l cn cc = case l of\n\
         \        <1>       -> cn;\n\

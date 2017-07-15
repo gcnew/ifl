@@ -255,9 +255,12 @@ mkBool :: GmState -> GmState
 mkBool state = state { gmStack = addr : gmStack state, gmVStack = vStack', gmHeap = heap' }
     where (n:vStack')   = gmVStack state
 
-          node | n == 1    = NConstr 1 []
-               | n == 2    = NConstr 2 []
+          node | n == 1    = NInd $ findGlobal "False"  -- NConstr 1 []
+               | n == 2    = NInd $ findGlobal "True"   -- NConstr 2 []
                | otherwise = error "mkBool: not a boolean"
+
+          findGlobal key = aLookup (gmGlobals state) key err
+              where err = error $ "Assert: Global not found: " ++ key
 
           (heap', addr) = hAlloc (gmHeap state) node
 
@@ -346,9 +349,16 @@ rearrange n heap stack = take n (map getArg (tail stack)) ++ drop n stack
     where getArg addr | (NAp _ arg) <- hLookup heap addr = arg
                       | otherwise = error "Broken spine: non NAp node encountered"
 
+boolIntrinsics :: [String]
+boolIntrinsics = [ "True", "False", "if" ]
+
+constrPrelude :: CoreProgram
+constrPrelude = foldr removeDefinition prelude0 boolIntrinsics
+    where prelude0 = preludeDefs ++ extraPreludeDefs ++ casePreludeDefs
+
 compile :: CoreProgram -> GmState
 compile program = GmState initialCode [] [] [] heap globals [] statInitial
-    where scDefs = program ++ preludeDefs ++ extraPreludeDefs ++ casePreludeDefs
+    where scDefs = program ++ constrPrelude
           (heap, globals) = buildInitialHeap scDefs
 
 initialCode :: GmCode
@@ -460,32 +470,44 @@ compileIfOrOp getEpilogue expr env
          guard $ not (aHasKey op env)      -- not a local variable
          guard $ not (aHasKey op globals)  -- not a global variable
 
-         mapStateT (return . runIdentity) $
-             if | op == "if" -> compileIf aps env
+         -- don't optimese `if` when booleans are redefined
+         guard $ op /= "if" || all (not . (`aHasKey` globals)) [ "True", "False" ]
 
-                | (Just opInfo) <- findBuiltIn op
-                    -> compileOp getEpilogue opInfo aps env
+         (opCc, arity) <- if | op == "if"
+                                -> return (compileIf, 3)
 
-                | otherwise  -> return Nothing
+                             | (Just (_, arity, instr)) <- findBuiltIn op
+                                -> return (compileOp instr, arity)
 
-compileOp :: (String -> GmCode)
-             -> (Name, Int, GmCode)
-             -> [CoreExpr]
-             -> GmEnvironment
-             -> State GmGlobals GmCode
-compileOp getEpilogue (op, arity, instr) aps env
-    = do let strictAps    = take arity aps
+                             | otherwise
+                                -> fail "Neither if nor OP."
+
+         let opArgs       = take arity aps
              lazyAps      = drop arity aps
              lazyApsCount = length lazyAps
-             epilogue     = instr ++ getEpilogue op
 
-         strictCode <- foldM (ccStrict env) epilogue strictAps
-         (_, code)  <- foldM (ccLazy env) (lazyApsCount, strictCode) lazyAps
+         opCode <- hoistMaybeT $ opCc opArgs env
+
+         let strictCode = opCode ++ getEpilogue op
+         (_, code)  <- hoistMaybeT $ foldM (ccLazy env) (lazyApsCount, strictCode) lazyAps
 
          return $ code ++ replicate lazyApsCount MkAp
 
+    where hoistMaybeT = mapStateT (return . runIdentity)
+
+
+compileOp :: GmCode -> [CoreExpr] -> GmEnvironment -> State GmGlobals GmCode
+compileOp instr args env = foldM (ccStrict env) instr args
+
 compileIf :: [CoreExpr] -> GmEnvironment -> State GmGlobals GmCode
-compileIf = undefined
+compileIf args env
+    = do let [cond, ifTrue, ifFalse] = args
+
+         cCond    <- compileB cond env
+         cIfTrue  <- compileE ifTrue env
+         cIfFalse <- compileE ifFalse env
+
+         return $ cCond ++ [ Cond cIfTrue cIfFalse ]
 
 ccStrict :: GmEnvironment -> GmCode -> CoreExpr -> State GmGlobals GmCode
 ccStrict env code expr = do cExpr <- compileB expr env
@@ -596,7 +618,11 @@ builtInSc = map cc builtIns
 compiledPrimitives :: [GmCompiledSC]
 compiledPrimitives = [
         ("abort", 0, [ Abort ]),
-        ("print", 2, [ Eval, Print, Update 0, Unwind ])
+        ("print", 2, [ Eval, Print, Update 0, Unwind ]),
+
+        ("False", 0, [ Pop 1, Pack 1 0, Unwind ]),
+        ("True",  0, [ Pop 1, Pack 2 0, Unwind ]),
+        ("if",    3, [ Eval, Get, Cond [Eval, Update 1, Pop 1] [Pop 1, Eval, Update 0], Unwind ])
         -- naive:
         -- ("print", 2, [ Push 0, Eval, Print, Push 1, Update 2, Pop 2, Unwind ])
     ]
@@ -616,6 +642,7 @@ isArith op = op `elem` map pluckName arithIns
 boxResult :: String -> GmCode
 boxResult op | isRelation op = [MkBool]
              | isArith    op = [MkInt]
+             | "if" == op    = []
              | otherwise     = error $ "boxResult: Unexpected operator: " ++ op
 
 showResults :: ShowStateOptions -> [GmState] -> String
